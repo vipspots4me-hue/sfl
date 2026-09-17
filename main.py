@@ -7,6 +7,7 @@ import platform
 import subprocess
 import threading
 import urllib.request
+import fcntl
 from pathlib import Path
 
 import streamlit as st
@@ -21,12 +22,10 @@ import streamlit as st
 # ============================================================
 # مسیرهای اصلی
 #
-# مهم:
-# /tmp حذف شده است.
-#
 # /mount/admin یک storage مربوط به Pod است.
-# بنابراین تا زمانی که همان Pod باقی باشد، فایل‌های SHL
-# بعد از restart پردازش Streamlit باقی می‌مانند.
+#
+# Ubuntu rootfs داخل این مسیر قرار دارد و بنابراین
+# restart شدن Streamlit/SSHX باعث حذف Ubuntu نمی‌شود.
 # ============================================================
 
 PERSISTENT_BASE = Path("/mount/admin/shl-runtime")
@@ -48,6 +47,14 @@ STATE_FILE = BASE_DIR / ".bootstrap.ok"
 SSHX_PID_FILE = BASE_DIR / "sshx.pid"
 SSHX_LINK_FILE = BASE_DIR / "sshx.link"
 SSHX_LOG_FILE = BASE_DIR / "sshx.log"
+
+# قفل بین‌پردازشی SSHX
+#
+# threading.Lock فقط داخل همان Python process کار می‌کند.
+# flock برای جلوگیری از اجرای همزمان SSHX در چند
+# Streamlit execution استفاده می‌شود.
+#
+SSHX_START_LOCK_FILE = BASE_DIR / "sshx.start.lock"
 
 UBUNTU_SHELL_WRAPPER = BASE_DIR / "ubuntu-shell"
 
@@ -105,31 +112,46 @@ bootstrap_lock = threading.Lock()
 # ============================================================
 
 def log(message):
-    print(f"[SHL] {message}", flush=True)
+
+    print(
+        f"[SHL] {message}",
+        flush=True,
+    )
 
 
 # ============================================================
 # اجرای command روی محیط میزبان
 # ============================================================
 
-def run_command(command, timeout=None, env=None):
+def run_command(
+    command,
+    timeout=None,
+    env=None,
+):
 
     if isinstance(command, str):
+
         shell_command = command
+
     else:
+
         shell_command = " ".join(
-            str(x) for x in command
+            str(x)
+            for x in command
         )
 
-    log(f"$ {shell_command}")
+    log(
+        f"$ {shell_command}"
+    )
 
     try:
 
         result = subprocess.run(
             command,
-            shell=True
-            if isinstance(command, str)
-            else False,
+            shell=isinstance(
+                command,
+                str,
+            ),
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
@@ -138,6 +160,7 @@ def run_command(command, timeout=None, env=None):
         )
 
         if result.stdout:
+
             print(
                 result.stdout,
                 flush=True,
@@ -156,7 +179,10 @@ def run_command(command, timeout=None, env=None):
             f"Command timeout after {timeout} seconds."
         )
 
-        return 124, output
+        return (
+            124,
+            output,
+        )
 
     except Exception as exc:
 
@@ -164,7 +190,10 @@ def run_command(command, timeout=None, env=None):
             f"Command failed: {exc}"
         )
 
-        return 1, str(exc)
+        return (
+            1,
+            str(exc),
+        )
 
 
 # ============================================================
@@ -177,7 +206,9 @@ def download_file(
     label,
 ):
 
-    destination = Path(destination)
+    destination = Path(
+        destination
+    )
 
     destination.parent.mkdir(
         parents=True,
@@ -191,9 +222,11 @@ def download_file(
     try:
 
         if part_file.exists():
+
             part_file.unlink()
 
     except Exception:
+
         pass
 
     try:
@@ -276,9 +309,11 @@ def download_file(
         try:
 
             if part_file.exists():
+
                 part_file.unlink()
 
         except Exception:
+
             pass
 
         return False
@@ -354,9 +389,12 @@ def prepare_storage():
 # Bootstrap lock
 # ============================================================
 
-def acquire_lock(timeout=180):
+def acquire_lock(
+    timeout=180,
+):
 
     if not prepare_storage():
+
         return False
 
     start = time.time()
@@ -377,26 +415,36 @@ def acquire_lock(timeout=180):
                 str(os.getpid()).encode(),
             )
 
-            os.close(fd)
+            os.close(
+                fd
+            )
 
             return True
 
         except FileExistsError:
 
-            if time.time() - start > timeout:
+            if (
+                time.time() - start
+                > timeout
+            ):
 
                 log(
                     "Bootstrap lock timeout."
                 )
 
                 try:
+
                     LOCK_FILE.unlink()
+
                 except Exception:
+
                     pass
 
                 continue
 
-            time.sleep(1)
+            time.sleep(
+                1
+            )
 
         except Exception as exc:
 
@@ -414,9 +462,11 @@ def release_lock():
         LOCK_FILE.unlink()
 
     except FileNotFoundError:
+
         pass
 
     except Exception:
+
         pass
 
 
@@ -636,8 +686,7 @@ def install_ubuntu():
         # ====================================================
         # DNS
         #
-        # مهم:
-        # دیگر resolv.conf را با PRoot bind نمی‌کنیم.
+        # resolv.conf با PRoot bind نمی‌شود.
         # ====================================================
 
         etc_dir = (
@@ -665,6 +714,7 @@ def install_ubuntu():
                 resolv.unlink()
 
         except Exception:
+
             pass
 
         resolv.write_text(
@@ -673,8 +723,13 @@ def install_ubuntu():
         )
 
         try:
-            resolv.chmod(0o644)
+
+            resolv.chmod(
+                0o644
+            )
+
         except Exception:
+
             pass
 
         # ====================================================
@@ -691,6 +746,7 @@ def install_ubuntu():
             )
 
         except Exception:
+
             pass
 
         # ====================================================
@@ -711,6 +767,7 @@ def install_ubuntu():
             )
 
         except Exception:
+
             pass
 
         log(
@@ -769,6 +826,7 @@ def install_proot():
                 return True
 
         except Exception:
+
             pass
 
     PROOT_DIR.mkdir(
@@ -785,8 +843,11 @@ def install_proot():
     if temp_file.exists():
 
         try:
+
             temp_file.unlink()
+
         except Exception:
+
             pass
 
     log(
@@ -853,11 +914,12 @@ def install_proot():
 # ============================================================
 # ساخت command مربوط به Ubuntu
 #
-# مهم:
 # resolv.conf دیگر bind نمی‌شود.
 # ============================================================
 
-def get_proot_command(command):
+def get_proot_command(
+    command,
+):
 
     return [
         str(PROOT_PATH),
@@ -913,7 +975,10 @@ def ubuntu_command(
     merged_env = os.environ.copy()
 
     if env:
-        merged_env.update(env)
+
+        merged_env.update(
+            env
+        )
 
     merged_env["HOME"] = "/root"
     merged_env["USER"] = "root"
@@ -953,7 +1018,10 @@ def ubuntu_command(
             f"{timeout} seconds."
         )
 
-        return 124, output
+        return (
+            124,
+            output,
+        )
 
     except Exception as exc:
 
@@ -961,7 +1029,10 @@ def ubuntu_command(
             f"Ubuntu command failed: {exc}"
         )
 
-        return 1, str(exc)
+        return (
+            1,
+            str(exc),
+        )
 
 
 # ============================================================
@@ -986,12 +1057,23 @@ cat /etc/resolv.conf 2>/dev/null || true
     )
 
     if code != 0:
-        return False, output
+
+        return (
+            False,
+            output,
+        )
 
     if "SHL_UBUNTU_OK" not in output:
-        return False, output
 
-    return True, output
+        return (
+            False,
+            output,
+        )
+
+    return (
+        True,
+        output,
+    )
 
 
 # ============================================================
@@ -1223,6 +1305,7 @@ def install_sshx():
             if path.is_file():
 
                 sshx_binary = path
+
                 break
 
         if sshx_binary is None:
@@ -1287,7 +1370,6 @@ def install_sshx():
 # ============================================================
 # ساخت wrapper برای ورود SSHX به Ubuntu
 #
-# مهم:
 # resolv.conf دیگر bind نمی‌شود.
 # ============================================================
 
@@ -1337,7 +1419,9 @@ exec "{PROOT_PATH}" \\
 # بررسی زنده بودن process
 # ============================================================
 
-def is_process_alive(pid):
+def is_process_alive(
+    pid,
+):
 
     try:
 
@@ -1362,6 +1446,51 @@ def is_process_alive(pid):
 
 
 # ============================================================
+# بررسی اینکه PID واقعاً SSHX است
+# ============================================================
+
+def is_sshx_process(
+    pid,
+):
+
+    try:
+
+        proc_cmdline = Path(
+            f"/proc/{int(pid)}/cmdline"
+        )
+
+        if not proc_cmdline.exists():
+
+            return False
+
+        raw = proc_cmdline.read_bytes()
+
+        command_line = (
+            raw
+            .replace(
+                b"\x00",
+                b" ",
+            )
+            .decode(
+                errors="ignore"
+            )
+            .strip()
+        )
+
+        if not command_line:
+
+            return False
+
+        return (
+            "sshx" in command_line.lower()
+        )
+
+    except Exception:
+
+        return False
+
+
+# ============================================================
 # PID ذخیره‌شده SSHX
 # ============================================================
 
@@ -1370,6 +1499,7 @@ def get_saved_sshx_pid():
     try:
 
         if not SSHX_PID_FILE.exists():
+
             return None
 
         text = (
@@ -1379,19 +1509,47 @@ def get_saved_sshx_pid():
         )
 
         if not text:
+
             return None
 
-        pid = int(text)
-
-        if is_process_alive(pid):
-
-            return pid
-
-        SSHX_PID_FILE.unlink(
-            missing_ok=True
+        pid = int(
+            text
         )
 
-        return None
+        if not is_process_alive(
+            pid
+        ):
+
+            SSHX_PID_FILE.unlink(
+                missing_ok=True
+            )
+
+            return None
+
+        # ----------------------------------------------------
+        # PID زنده است ولی SSHX نیست
+        # ----------------------------------------------------
+
+        if not is_sshx_process(
+            pid
+        ):
+
+            log(
+                f"Stored PID {pid} is not SSHX. "
+                "Clearing stale state."
+            )
+
+            SSHX_PID_FILE.unlink(
+                missing_ok=True
+            )
+
+            SSHX_LINK_FILE.unlink(
+                missing_ok=True
+            )
+
+            return None
+
+        return pid
 
     except Exception:
 
@@ -1407,6 +1565,7 @@ def get_saved_sshx_link():
     try:
 
         if not SSHX_LINK_FILE.exists():
+
             return None
 
         link = (
@@ -1436,9 +1595,12 @@ def get_saved_sshx_link():
 # استخراج لینک SSHX از log
 # ============================================================
 
-def extract_sshx_link(text):
+def extract_sshx_link(
+    text,
+):
 
     if not text:
+
         return None
 
     pattern = (
@@ -1462,96 +1624,224 @@ def extract_sshx_link(text):
 
 # ============================================================
 # اجرای SSHX
+#
+# اصلاحات مهم:
+#
+# 1. flock برای جلوگیری از چند SSHX همزمان
+# 2. بررسی PID + لینک قبل از Start
+# 3. پاک کردن log قدیمی قبل از Start
+# 4. خواندن فقط log مربوط به همین اجرای جدید
+# 5. جلوگیری از استفاده از URL قدیمی
 # ============================================================
 
 def start_sshx():
 
     with bootstrap_lock:
 
-        existing_pid = (
-            get_saved_sshx_pid()
+        BASE_DIR.mkdir(
+            parents=True,
+            exist_ok=True,
         )
 
-        existing_link = (
-            get_saved_sshx_link()
-        )
-
-        if (
-            existing_pid
-            and existing_link
-        ):
-
-            log(
-                "SSHX already running. "
-                f"PID={existing_pid}"
-            )
-
-            log(
-                f"SSHX URL: {existing_link}"
-            )
-
-            return existing_link
-
-        sshx_path = install_sshx()
-
-        if not sshx_path:
-            return None
-
-        if not create_ubuntu_shell_wrapper():
-            return None
-
-        log(
-            "Starting SSHX..."
-        )
-
-        env = os.environ.copy()
-
-        env["SHELL"] = str(
-            UBUNTU_SHELL_WRAPPER
-        )
-
-        env["TERM"] = env.get(
-            "TERM",
-            "xterm-256color",
-        )
-
-        env["HOME"] = "/home/appuser"
+        # ====================================================
+        # قفل بین‌پردازشی
+        # ====================================================
 
         try:
 
-            log_file = open(
-                SSHX_LOG_FILE,
-                "a",
-                buffering=1,
+            start_lock_file = open(
+                SSHX_START_LOCK_FILE,
+                "w",
             )
 
-            log_file.write(
-                "\n\n===== SSHX START =====\n"
+            fcntl.flock(
+                start_lock_file.fileno(),
+                fcntl.LOCK_EX,
             )
 
-        except Exception:
+        except Exception as exc:
 
-            log_file = (
-                subprocess.DEVNULL
+            log(
+                f"Cannot acquire SSHX start lock: {exc}"
             )
+
+            return None
 
         try:
 
-            process = subprocess.Popen(
-                [
-                    str(sshx_path),
-                    "--quiet",
-                ],
-                stdin=subprocess.DEVNULL,
-                stdout=log_file,
-                stderr=subprocess.STDOUT,
-                env=env,
-                start_new_session=True,
+            # =================================================
+            # ابتدا SSHX موجود را بررسی کن
+            # =================================================
+
+            existing_pid = (
+                get_saved_sshx_pid()
             )
+
+            existing_link = (
+                get_saved_sshx_link()
+            )
+
+            if (
+                existing_pid
+                and existing_link
+            ):
+
+                log(
+                    "SSHX already running. "
+                    f"PID={existing_pid}"
+                )
+
+                log(
+                    f"SSHX URL: {existing_link}"
+                )
+
+                return existing_link
+
+            # =================================================
+            # اگر state قدیمی خراب است پاک شود
+            # =================================================
+
+            SSHX_PID_FILE.unlink(
+                missing_ok=True
+            )
+
+            SSHX_LINK_FILE.unlink(
+                missing_ok=True
+            )
+
+            # =================================================
+            # نصب SSHX
+            # =================================================
+
+            sshx_path = install_sshx()
+
+            if not sshx_path:
+
+                return None
+
+            # =================================================
+            # ساخت wrapper
+            # =================================================
+
+            if not create_ubuntu_shell_wrapper():
+
+                return None
+
+            # =================================================
+            # پاک کردن log قبلی
+            #
+            # جلوگیری از استفاده از URL قدیمی
+            # =================================================
+
+            try:
+
+                SSHX_LOG_FILE.write_text(
+                    ""
+                )
+
+            except Exception as exc:
+
+                log(
+                    f"Cannot clear SSHX log: {exc}"
+                )
+
+                return None
+
+            log(
+                "Starting SSHX..."
+            )
+
+            env = os.environ.copy()
+
+            env["SHELL"] = str(
+                UBUNTU_SHELL_WRAPPER
+            )
+
+            env["TERM"] = env.get(
+                "TERM",
+                "xterm-256color",
+            )
+
+            env["HOME"] = "/home/appuser"
+
+            # =================================================
+            # باز کردن log
+            # =================================================
+
+            try:
+
+                log_file = open(
+                    SSHX_LOG_FILE,
+                    "a",
+                    buffering=1,
+                )
+
+                log_file.write(
+                    "===== SSHX START =====\n"
+                )
+
+                log_file.flush()
+
+            except Exception:
+
+                log_file = (
+                    subprocess.DEVNULL
+                )
+
+            # =================================================
+            # اجرای SSHX
+            # =================================================
+
+            try:
+
+                process = subprocess.Popen(
+                    [
+                        str(sshx_path),
+                        "--quiet",
+                    ],
+                    stdin=subprocess.DEVNULL,
+                    stdout=log_file,
+                    stderr=subprocess.STDOUT,
+                    env=env,
+                    start_new_session=True,
+                )
+
+            except Exception as exc:
+
+                log(
+                    f"SSHX process creation failed: {exc}"
+                )
+
+                try:
+
+                    if log_file not in (
+                        subprocess.DEVNULL,
+                        None,
+                    ):
+
+                        log_file.close()
+
+                except Exception:
+
+                    pass
+
+                return None
+
+            # =================================================
+            # ذخیره PID
+            # =================================================
 
             SSHX_PID_FILE.write_text(
                 str(process.pid)
             )
+
+            log(
+                f"SSHX process started. PID={process.pid}"
+            )
+
+            # =================================================
+            # انتظار برای لینک
+            # =================================================
 
             link = None
 
@@ -1563,6 +1853,10 @@ def start_sshx():
 
             while time.time() < deadline:
 
+                # ---------------------------------------------
+                # process مرده؟
+                # ---------------------------------------------
+
                 if process.poll() is not None:
 
                     log(
@@ -1571,44 +1865,65 @@ def start_sshx():
 
                     break
 
+                # ---------------------------------------------
+                # فقط بخش جدید log
+                # ---------------------------------------------
+
                 try:
 
-                    text = (
-                        SSHX_LOG_FILE
-                        .read_text(
-                            errors="ignore"
-                        )
+                    current_size = (
+                        SSHX_LOG_FILE.stat().st_size
                     )
 
-                    if len(text) > last_log_size:
+                    if current_size > last_log_size:
 
-                        new_text = text[
-                            last_log_size:
-                        ]
+                        with open(
+                            SSHX_LOG_FILE,
+                            "r",
+                            errors="ignore",
+                        ) as f:
 
-                        last_log_size = len(
-                            text
-                        )
-
-                        print(
-                            new_text,
-                            end="",
-                            flush=True,
-                        )
-
-                        link = (
-                            extract_sshx_link(
-                                new_text
+                            f.seek(
+                                last_log_size
                             )
+
+                            new_text = f.read()
+
+                        last_log_size = (
+                            current_size
                         )
 
-                        if link:
-                            break
+                        if new_text:
+
+                            print(
+                                new_text,
+                                end="",
+                                flush=True,
+                            )
+
+                            detected = (
+                                extract_sshx_link(
+                                    new_text
+                                )
+                            )
+
+                            if detected:
+
+                                link = detected
+
+                                break
 
                 except Exception:
+
                     pass
 
-                time.sleep(0.5)
+                time.sleep(
+                    0.5
+                )
+
+            # =================================================
+            # لینک پیدا شد
+            # =================================================
 
             if link:
 
@@ -1620,22 +1935,69 @@ def start_sshx():
                     f"SSHX URL: {link}"
                 )
 
+                try:
+
+                    if log_file not in (
+                        subprocess.DEVNULL,
+                        None,
+                    ):
+
+                        log_file.close()
+
+                except Exception:
+
+                    pass
+
                 return link
+
+            # =================================================
+            # لینک پیدا نشد
+            # =================================================
 
             if process.poll() is None:
 
                 try:
+
                     process.terminate()
+
                 except Exception:
+
                     pass
 
+            try:
+
+                process.wait(
+                    timeout=5
+                )
+
+            except Exception:
+
+                pass
+
             SSHX_PID_FILE.unlink(
+                missing_ok=True
+            )
+
+            SSHX_LINK_FILE.unlink(
                 missing_ok=True
             )
 
             log(
                 "SSHX URL was not detected."
             )
+
+            try:
+
+                if log_file not in (
+                    subprocess.DEVNULL,
+                    None,
+                ):
+
+                    log_file.close()
+
+            except Exception:
+
+                pass
 
             return None
 
@@ -1645,16 +2007,34 @@ def start_sshx():
                 f"SSHX start failed: {exc}"
             )
 
-            try:
+            SSHX_PID_FILE.unlink(
+                missing_ok=True
+            )
 
-                SSHX_PID_FILE.unlink(
-                    missing_ok=True
-                )
-
-            except Exception:
-                pass
+            SSHX_LINK_FILE.unlink(
+                missing_ok=True
+            )
 
             return None
+
+        finally:
+
+            # =================================================
+            # آزاد کردن flock
+            # =================================================
+
+            try:
+
+                fcntl.flock(
+                    start_lock_file.fileno(),
+                    fcntl.LOCK_UN,
+                )
+
+                start_lock_file.close()
+
+            except Exception:
+
+                pass
 
 
 # ============================================================
@@ -1663,45 +2043,85 @@ def start_sshx():
 
 def stop_sshx():
 
-    pid = get_saved_sshx_pid()
-
-    if pid:
-
-        log(
-            f"Stopping SSHX PID={pid}"
-        )
+    with bootstrap_lock:
 
         try:
 
-            os.kill(
-                pid,
-                15,
+            start_lock_file = open(
+                SSHX_START_LOCK_FILE,
+                "w",
+            )
+
+            fcntl.flock(
+                start_lock_file.fileno(),
+                fcntl.LOCK_EX,
             )
 
         except Exception:
-            pass
 
-        for _ in range(20):
+            start_lock_file = None
 
-            if not is_process_alive(
-                pid
-            ):
+        try:
 
-                break
+            pid = get_saved_sshx_pid()
 
-            time.sleep(0.1)
+            if pid:
 
-    SSHX_PID_FILE.unlink(
-        missing_ok=True
-    )
+                log(
+                    f"Stopping SSHX PID={pid}"
+                )
 
-    SSHX_LINK_FILE.unlink(
-        missing_ok=True
-    )
+                try:
 
-    log(
-        "SSHX state cleared."
-    )
+                    os.kill(
+                        pid,
+                        15,
+                    )
+
+                except Exception:
+
+                    pass
+
+                for _ in range(20):
+
+                    if not is_process_alive(
+                        pid
+                    ):
+
+                        break
+
+                    time.sleep(
+                        0.1
+                    )
+
+            SSHX_PID_FILE.unlink(
+                missing_ok=True
+            )
+
+            SSHX_LINK_FILE.unlink(
+                missing_ok=True
+            )
+
+            log(
+                "SSHX state cleared."
+            )
+
+        finally:
+
+            if start_lock_file:
+
+                try:
+
+                    fcntl.flock(
+                        start_lock_file.fileno(),
+                        fcntl.LOCK_UN,
+                    )
+
+                    start_lock_file.close()
+
+                except Exception:
+
+                    pass
 
 
 # ============================================================
@@ -1890,7 +2310,10 @@ ls -ld /root 2>/dev/null || true
         timeout=60,
     )
 
-    return code, output
+    return (
+        code,
+        output,
+    )
 
 
 # ============================================================
