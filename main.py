@@ -14,13 +14,24 @@ import streamlit as st
 
 # ============================================================
 # SHL - Streamlit → Ubuntu 22.04.5 → PRoot → SSHX
+# Persistent runtime version
 # ============================================================
+
 
 # ============================================================
 # مسیرهای اصلی
+#
+# مهم:
+# /tmp حذف شده است.
+#
+# /mount/admin یک storage مربوط به Pod است.
+# بنابراین تا زمانی که همان Pod باقی باشد، فایل‌های SHL
+# بعد از restart پردازش Streamlit باقی می‌مانند.
 # ============================================================
 
-BASE_DIR = Path("/tmp/shl-runtime")
+PERSISTENT_BASE = Path("/mount/admin/shl-runtime")
+
+BASE_DIR = PERSISTENT_BASE
 
 ROOTFS_DIR = BASE_DIR / "ubuntu"
 PROOT_DIR = BASE_DIR / "proot"
@@ -28,6 +39,7 @@ PROOT_PATH = PROOT_DIR / "proot"
 
 LOCK_FILE = BASE_DIR / ".bootstrap.lock"
 STATE_FILE = BASE_DIR / ".bootstrap.ok"
+
 
 # ============================================================
 # فایل‌های وضعیت SSHX
@@ -38,6 +50,20 @@ SSHX_LINK_FILE = BASE_DIR / "sshx.link"
 SSHX_LOG_FILE = BASE_DIR / "sshx.log"
 
 UBUNTU_SHELL_WRAPPER = BASE_DIR / "ubuntu-shell"
+
+
+# ============================================================
+# فایل‌های دانلود
+# ============================================================
+
+UBUNTU_ARCHIVE = (
+    BASE_DIR / "ubuntu-22.04.5-base-amd64.tar.gz"
+)
+
+SSHX_ARCHIVE = (
+    BASE_DIR / "sshx.tar.gz"
+)
+
 
 # ============================================================
 # URLها
@@ -58,19 +84,14 @@ SSHX_URL = (
     "sshx-x86_64-unknown-linux-musl.tar.gz"
 )
 
+
 # ============================================================
 # مسیر ثابت SSHX
-#
-# در Streamlit مسیر HOME ممکن است /root باشد.
-# اما SSHX قبلاً در این مسیر نصب شده:
-#
-# /home/appuser/.local/bin/sshx
-#
-# بنابراین دیگر از Path.home() استفاده نمی‌کنیم.
 # ============================================================
 
 SSHX_DIR = Path("/home/appuser/.local/bin")
 SSHX_PATH = SSHX_DIR / "sshx"
+
 
 # ============================================================
 # Lock داخلی Python
@@ -88,21 +109,27 @@ def log(message):
 
 
 # ============================================================
-# اجرای command روی Debian میزبان
+# اجرای command روی محیط میزبان
 # ============================================================
 
 def run_command(command, timeout=None, env=None):
+
     if isinstance(command, str):
         shell_command = command
     else:
-        shell_command = " ".join(str(x) for x in command)
+        shell_command = " ".join(
+            str(x) for x in command
+        )
 
     log(f"$ {shell_command}")
 
     try:
+
         result = subprocess.run(
             command,
-            shell=True if isinstance(command, str) else False,
+            shell=True
+            if isinstance(command, str)
+            else False,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
@@ -111,11 +138,18 @@ def run_command(command, timeout=None, env=None):
         )
 
         if result.stdout:
-            print(result.stdout, flush=True)
+            print(
+                result.stdout,
+                flush=True,
+            )
 
-        return result.returncode, result.stdout or ""
+        return (
+            result.returncode,
+            result.stdout or "",
+        )
 
     except subprocess.TimeoutExpired as exc:
+
         output = exc.stdout or ""
 
         log(
@@ -125,7 +159,10 @@ def run_command(command, timeout=None, env=None):
         return 124, output
 
     except Exception as exc:
-        log(f"Command failed: {exc}")
+
+        log(
+            f"Command failed: {exc}"
+        )
 
         return 1, str(exc)
 
@@ -134,7 +171,12 @@ def run_command(command, timeout=None, env=None):
 # دانلود فایل
 # ============================================================
 
-def download_file(url, destination, label):
+def download_file(
+    url,
+    destination,
+    label,
+):
+
     destination = Path(destination)
 
     destination.parent.mkdir(
@@ -147,6 +189,7 @@ def download_file(url, destination, label):
     )
 
     try:
+
         if part_file.exists():
             part_file.unlink()
 
@@ -154,6 +197,7 @@ def download_file(url, destination, label):
         pass
 
     try:
+
         log(
             f"Downloading {label}: {url}"
         )
@@ -163,6 +207,7 @@ def download_file(url, destination, label):
             block_size,
             total_size,
         ):
+
             if total_size and total_size > 0:
 
                 downloaded = (
@@ -182,6 +227,7 @@ def download_file(url, destination, label):
                     progress_hook,
                     "last_bucket",
                 ):
+
                     progress_hook.last_bucket = -1
 
                 if (
@@ -189,6 +235,7 @@ def download_file(url, destination, label):
                     != progress_hook.last_bucket
                     or percent >= 100
                 ):
+
                     progress_hook.last_bucket = bucket
 
                     log(
@@ -203,16 +250,20 @@ def download_file(url, destination, label):
         )
 
         if not part_file.exists():
+
             raise RuntimeError(
                 f"{label} download produced no file"
             )
 
         if part_file.stat().st_size <= 0:
+
             raise RuntimeError(
                 f"{label} download produced an empty file"
             )
 
-        part_file.replace(destination)
+        part_file.replace(
+            destination
+        )
 
         return True
 
@@ -223,8 +274,10 @@ def download_file(url, destination, label):
         )
 
         try:
+
             if part_file.exists():
                 part_file.unlink()
+
         except Exception:
             pass
 
@@ -247,15 +300,18 @@ def detect_arch():
         "x86_64",
         "amd64",
     ):
+
         arch = "amd64"
 
     elif machine in (
         "aarch64",
         "arm64",
     ):
+
         arch = "arm64"
 
     else:
+
         arch = machine
 
     log(
@@ -266,15 +322,42 @@ def detect_arch():
 
 
 # ============================================================
+# آماده‌سازی Storage
+# ============================================================
+
+def prepare_storage():
+
+    try:
+
+        BASE_DIR.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        log(
+            f"Persistent SHL storage: {BASE_DIR}"
+        )
+
+        return True
+
+    except Exception as exc:
+
+        log(
+            "Cannot create persistent storage: "
+            f"{exc}"
+        )
+
+        return False
+
+
+# ============================================================
 # Bootstrap lock
 # ============================================================
 
 def acquire_lock(timeout=180):
 
-    BASE_DIR.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
+    if not prepare_storage():
+        return False
 
     start = time.time()
 
@@ -327,6 +410,7 @@ def acquire_lock(timeout=180):
 def release_lock():
 
     try:
+
         LOCK_FILE.unlink()
 
     except FileNotFoundError:
@@ -392,6 +476,10 @@ def install_ubuntu():
         / "bash"
     )
 
+    # --------------------------------------------------------
+    # Ubuntu موجود است
+    # --------------------------------------------------------
+
     if bash_path.exists():
 
         log(
@@ -407,11 +495,6 @@ def install_ubuntu():
     BASE_DIR.mkdir(
         parents=True,
         exist_ok=True,
-    )
-
-    archive = (
-        BASE_DIR
-        / "ubuntu-22.04.5-base-amd64.tar.gz"
     )
 
     extracting_dir = (
@@ -430,21 +513,26 @@ def install_ubuntu():
             ignore_errors=True,
         )
 
+    # --------------------------------------------------------
+    # دانلود Ubuntu فقط در صورت نیاز
+    # --------------------------------------------------------
+
     if (
-        not archive.exists()
-        or archive.stat().st_size <= 0
+        not UBUNTU_ARCHIVE.exists()
+        or UBUNTU_ARCHIVE.stat().st_size <= 0
     ):
 
         if not download_file(
             UBUNTU_URL,
-            archive,
+            UBUNTU_ARCHIVE,
             "Ubuntu 22.04.5",
         ):
+
             return False
 
     if (
-        not archive.exists()
-        or archive.stat().st_size <= 0
+        not UBUNTU_ARCHIVE.exists()
+        or UBUNTU_ARCHIVE.stat().st_size <= 0
     ):
 
         log(
@@ -465,9 +553,13 @@ def install_ubuntu():
         )
 
         safe_extract(
-            archive,
+            UBUNTU_ARCHIVE,
             extracting_dir,
         )
+
+        # ----------------------------------------------------
+        # Normalize archive
+        # ----------------------------------------------------
 
         if not (
             extracting_dir
@@ -526,6 +618,10 @@ def install_ubuntu():
                 "did not contain /bin/bash"
             )
 
+        # ----------------------------------------------------
+        # جایگزینی rootfs
+        # ----------------------------------------------------
+
         if ROOTFS_DIR.exists():
 
             shutil.rmtree(
@@ -537,9 +633,12 @@ def install_ubuntu():
             ROOTFS_DIR
         )
 
-        # ----------------------------------------------------
+        # ====================================================
         # DNS
-        # ----------------------------------------------------
+        #
+        # مهم:
+        # دیگر resolv.conf را با PRoot bind نمی‌کنیم.
+        # ====================================================
 
         etc_dir = (
             ROOTFS_DIR
@@ -562,6 +661,7 @@ def install_ubuntu():
                 resolv.exists()
                 or resolv.is_symlink()
             ):
+
                 resolv.unlink()
 
         except Exception:
@@ -572,9 +672,14 @@ def install_ubuntu():
             "nameserver 8.8.8.8\n"
         )
 
-        # ----------------------------------------------------
+        try:
+            resolv.chmod(0o644)
+        except Exception:
+            pass
+
+        # ====================================================
         # hostname
-        # ----------------------------------------------------
+        # ====================================================
 
         try:
 
@@ -588,9 +693,9 @@ def install_ubuntu():
         except Exception:
             pass
 
-        # ----------------------------------------------------
+        # ====================================================
         # hosts
-        # ----------------------------------------------------
+        # ====================================================
 
         try:
 
@@ -694,6 +799,7 @@ def install_proot():
         temp_file,
         "PRoot amd64",
     ):
+
         return False
 
     try:
@@ -746,6 +852,9 @@ def install_proot():
 
 # ============================================================
 # ساخت command مربوط به Ubuntu
+#
+# مهم:
+# resolv.conf دیگر bind نمی‌شود.
 # ============================================================
 
 def get_proot_command(command):
@@ -772,9 +881,6 @@ def get_proot_command(command):
 
         "-b",
         "/sys",
-
-        "-b",
-        f"{ROOTFS_DIR}/etc/resolv.conf:/etc/resolv.conf",
 
         "/bin/bash",
 
@@ -827,6 +933,7 @@ def ubuntu_command(
         )
 
         if result.stdout:
+
             print(
                 result.stdout,
                 flush=True,
@@ -869,6 +976,8 @@ echo "USER=$(id -un)"
 echo "UID=$(id -u)"
 echo "OS=$(grep PRETTY_NAME /etc/os-release 2>/dev/null)"
 echo "ARCH=$(uname -m)"
+echo "ROOTFS_DNS:"
+cat /etc/resolv.conf 2>/dev/null || true
 """
 
     code, output = ubuntu_command(
@@ -961,15 +1070,6 @@ touch /root/.shl_tools_ready
 
 # ============================================================
 # پیدا کردن SSHX
-#
-# مهم:
-# قبلاً /root/.local/bin/sshx در لیست بود و
-# candidate.exists() باعث PermissionError شد.
-#
-# این نسخه:
-# 1. مسیر واقعی /home/appuser را اول بررسی می‌کند.
-# 2. /root را اصلاً بررسی نمی‌کند.
-# 3. تمام PermissionErrorها را کنترل می‌کند.
 # ============================================================
 
 def find_sshx():
@@ -1000,10 +1100,6 @@ def find_sshx():
         ):
 
             continue
-
-    # --------------------------------------------------------
-    # جستجوی PATH
-    # --------------------------------------------------------
 
     try:
 
@@ -1052,10 +1148,6 @@ def find_sshx():
 
 def install_sshx():
 
-    # --------------------------------------------------------
-    # اول SSHX موجود را پیدا کن
-    # --------------------------------------------------------
-
     existing = find_sshx()
 
     if existing:
@@ -1065,10 +1157,6 @@ def install_sshx():
         )
 
         return existing
-
-    # --------------------------------------------------------
-    # مسیر صحیح کاربر Streamlit
-    # --------------------------------------------------------
 
     try:
 
@@ -1086,29 +1174,17 @@ def install_sshx():
 
         return None
 
-    archive = (
-        BASE_DIR
-        / "sshx.tar.gz"
-    )
-
-    # --------------------------------------------------------
-    # دانلود
-    # --------------------------------------------------------
-
     log(
         "Downloading SSHX..."
     )
 
     if not download_file(
         SSHX_URL,
-        archive,
+        SSHX_ARCHIVE,
         "SSHX",
     ):
-        return None
 
-    # --------------------------------------------------------
-    # استخراج
-    # --------------------------------------------------------
+        return None
 
     extract_dir = (
         BASE_DIR
@@ -1130,7 +1206,7 @@ def install_sshx():
     try:
 
         with tarfile.open(
-            archive,
+            SSHX_ARCHIVE,
             "r:gz",
         ) as tar:
 
@@ -1147,7 +1223,6 @@ def install_sshx():
             if path.is_file():
 
                 sshx_binary = path
-
                 break
 
         if sshx_binary is None:
@@ -1158,10 +1233,6 @@ def install_sshx():
             )
 
             return None
-
-        # ----------------------------------------------------
-        # کپی به مسیر ثابت
-        # ----------------------------------------------------
 
         shutil.copy2(
             sshx_binary,
@@ -1175,10 +1246,6 @@ def install_sshx():
         log(
             f"SSHX installed: {SSHX_PATH}"
         )
-
-        # ----------------------------------------------------
-        # تست
-        # ----------------------------------------------------
 
         try:
 
@@ -1219,6 +1286,9 @@ def install_sshx():
 
 # ============================================================
 # ساخت wrapper برای ورود SSHX به Ubuntu
+#
+# مهم:
+# resolv.conf دیگر bind نمی‌شود.
 # ============================================================
 
 def create_ubuntu_shell_wrapper():
@@ -1230,12 +1300,6 @@ def create_ubuntu_shell_wrapper():
 
     wrapper_content = f"""#!/bin/bash
 
-# ============================================================
-# این فایل shell پیش‌فرض SSHX است.
-# SSHX این wrapper را اجرا می‌کند.
-# سپس wrapper وارد Ubuntu 22.04.5 می‌شود.
-# ============================================================
-
 exec "{PROOT_PATH}" \\
     -r "{ROOTFS_DIR}" \\
     -0 \\
@@ -1244,7 +1308,6 @@ exec "{PROOT_PATH}" \\
     -b /dev/pts \\
     -b /proc \\
     -b /sys \\
-    -b "{ROOTFS_DIR}/etc/resolv.conf:/etc/resolv.conf" \\
     /bin/bash -l
 """
 
@@ -1405,10 +1468,6 @@ def start_sshx():
 
     with bootstrap_lock:
 
-        # ----------------------------------------------------
-        # اگر SSHX قبلاً اجراست، لینک قبلی را استفاده کن
-        # ----------------------------------------------------
-
         existing_pid = (
             get_saved_sshx_pid()
         )
@@ -1433,37 +1492,13 @@ def start_sshx():
 
             return existing_link
 
-        if (
-            existing_pid
-            and not existing_link
-        ):
-
-            log(
-                "SSHX process exists "
-                "but link file is missing."
-            )
-
-        # ----------------------------------------------------
-        # نصب / پیدا کردن SSHX
-        # ----------------------------------------------------
-
         sshx_path = install_sshx()
 
         if not sshx_path:
-
             return None
-
-        # ----------------------------------------------------
-        # ساخت shell wrapper
-        # ----------------------------------------------------
 
         if not create_ubuntu_shell_wrapper():
-
             return None
-
-        # ----------------------------------------------------
-        # محیط SSHX
-        # ----------------------------------------------------
 
         log(
             "Starting SSHX..."
@@ -1482,10 +1517,6 @@ def start_sshx():
 
         env["HOME"] = "/home/appuser"
 
-        # ----------------------------------------------------
-        # لاگ SSHX
-        # ----------------------------------------------------
-
         try:
 
             log_file = open(
@@ -1503,10 +1534,6 @@ def start_sshx():
             log_file = (
                 subprocess.DEVNULL
             )
-
-        # ----------------------------------------------------
-        # اجرای SSHX
-        # ----------------------------------------------------
 
         try:
 
@@ -1576,19 +1603,12 @@ def start_sshx():
                         )
 
                         if link:
-
                             break
 
                 except Exception:
                     pass
 
-                time.sleep(
-                    0.5
-                )
-
-            # ------------------------------------------------
-            # لینک پیدا شد
-            # ------------------------------------------------
+                time.sleep(0.5)
 
             if link:
 
@@ -1602,16 +1622,10 @@ def start_sshx():
 
                 return link
 
-            # ------------------------------------------------
-            # لینک پیدا نشد
-            # ------------------------------------------------
-
             if process.poll() is None:
 
                 try:
-
                     process.terminate()
-
                 except Exception:
                     pass
 
@@ -1675,9 +1689,7 @@ def stop_sshx():
 
                 break
 
-            time.sleep(
-                0.1
-            )
+            time.sleep(0.1)
 
     SSHX_PID_FILE.unlink(
         missing_ok=True
@@ -1698,9 +1710,28 @@ def stop_sshx():
 
 def bootstrap():
 
-    BASE_DIR.mkdir(
-        parents=True,
-        exist_ok=True,
+    # --------------------------------------------------------
+    # Storage
+    # --------------------------------------------------------
+
+    if not prepare_storage():
+
+        log(
+            "Persistent storage is unavailable."
+        )
+
+        return False
+
+    log(
+        f"SHL persistent directory: {BASE_DIR}"
+    )
+
+    log(
+        f"Ubuntu rootfs: {ROOTFS_DIR}"
+    )
+
+    log(
+        f"PRoot: {PROOT_PATH}"
     )
 
     # --------------------------------------------------------
@@ -1726,7 +1757,7 @@ def bootstrap():
                 return False
 
             log(
-                "SHL bootstrap completed."
+                "Existing persistent Ubuntu is ready."
             )
 
             return True
@@ -1811,7 +1842,7 @@ def bootstrap():
         # ----------------------------------------------------
 
         STATE_FILE.write_text(
-            "SHL bootstrap OK\n"
+            "SHL persistent bootstrap OK\n"
         )
 
         log(
@@ -1844,6 +1875,14 @@ df -h /
 echo
 echo "MEMORY:"
 free -h
+
+echo
+echo "DNS:"
+cat /etc/resolv.conf 2>/dev/null || true
+
+echo
+echo "PERSISTENT ROOT:"
+ls -ld /root 2>/dev/null || true
 """
 
     code, output = ubuntu_command(
@@ -1950,6 +1989,15 @@ else:
     st.caption(
         "SSHX process: not detected"
     )
+
+
+# ============================================================
+# مسیر Persistence
+# ============================================================
+
+st.caption(
+    f"Persistent storage: {BASE_DIR}"
+)
 
 
 # ============================================================
