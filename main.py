@@ -1,4 +1,3 @@
-```python
 import os
 import re
 import time
@@ -1164,4 +1163,3 @@ st.caption(
 st.caption(
     f"Architecture: {platform.machine()}"
 )
-```
