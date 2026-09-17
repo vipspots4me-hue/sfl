@@ -1,114 +1,1218 @@
 import os
-import sys
+import re
 import io
+import sys
 import json
 import time
 import base64
-import hashlib
-import tarfile
-import signal
 import shutil
+import signal
+import hashlib
 import logging
-import threading
+import tarfile
+import tempfile
 import subprocess
+import threading
 import urllib.request
 import urllib.error
-import re
 from pathlib import Path
 from datetime import datetime, timezone
 
+import requests
 import streamlit as st
+
+try:
+    import fcntl
+except ImportError:
+    fcntl = None
 
 
 # ============================================================
-# SHL - Persistent Ubuntu Server on Streamlit
-# GitHub-backed persistence
+# SHL - STREAMLIT PERSISTENT UBUNTU
 # ============================================================
 
 APP_NAME = "SHL"
-
-# ============================================================
-# GitHub configuration
-# ============================================================
-
-GITHUB_REPO = "vipspots4me-hue/sfl"
-GITHUB_BRANCH = "main"
-
-# Persistent branch used only for server state
-PERSISTENT_BRANCH = "shl-persistent"
-
-GITHUB_API = "https://api.github.com"
-
-# GitHub individual file limit is 100 MB.
-# Keep considerably below that.
-CHUNK_SIZE = 45 * 1024 * 1024
-
-# Backup debounce
-BACKUP_DEBOUNCE = 15
-
-# Minimum time between automatic GitHub backups
-MIN_BACKUP_INTERVAL = 60
-
-
-# ============================================================
-# Runtime directories
-# ============================================================
+APP_VERSION = "3.0"
 
 BASE_DIR = Path("/tmp/shl-runtime")
-
 ROOTFS_DIR = BASE_DIR / "ubuntu"
 PROOT_DIR = BASE_DIR / "proot"
 RESTORE_DIR = BASE_DIR / "restore"
-
 STATE_DIR = BASE_DIR / "state"
 
-SSHX_DIR = Path.home() / ".local" / "bin"
+SSHX_DIR = ROOTFS_DIR / "root/.local/bin"
 SSHX_PATH = SSHX_DIR / "sshx"
 
 SSHX_PID_FILE = STATE_DIR / "sshx.pid"
-SSHX_LINK_FILE = STATE_DIR / "sshx.link"
 SSHX_LOG_FILE = STATE_DIR / "sshx.log"
+SSHX_LOCK_FILE = STATE_DIR / "sshx.lock"
 
-BACKUP_STATE_FILE = STATE_DIR / "backup-state.json"
+BOOTSTRAP_LOCK_FILE = STATE_DIR / "bootstrap.lock"
 BACKUP_LOCK_FILE = STATE_DIR / "backup.lock"
 
-SERVICE_DIR = ROOTFS_DIR / "etc" / "shl" / "services"
+BACKUP_STATE_FILE = STATE_DIR / "backup-state.json"
+WATCHER_STATE_FILE = STATE_DIR / "watcher-state.json"
 
-BASE_PACKAGES_MARKER = ROOTFS_DIR / "etc" / "shl" / ".base-packages-installed"
+SNAPSHOT_FILE = BASE_DIR / "ubuntu-snapshot.tar.gz"
 
-UBUNTU_VERSION = "22.04.5"
+SERVICE_DIR = ROOTFS_DIR / "etc/shl/services"
 
 UBUNTU_URL = (
-    "https://cdimage.ubuntu.com/ubuntu-base/releases/"
-    "22.04/release/"
+    "https://cdimage.ubuntu.com/ubuntu-base/releases/22.04/release/"
     "ubuntu-base-22.04.5-base-amd64.tar.gz"
 )
 
 PROOT_URL = (
-    "https://github.com/Mytai20100/freeproot/releases/latest/"
-    "download/proot-amd64"
+    "https://github.com/Mytai20100/freeproot/releases/latest/download/"
+    "proot-amd64"
 )
 
-SSHX_INSTALLER = "https://sshx.io/get"
+SSHX_BINARY_URL = (
+    "https://s3.amazonaws.com/sshx/"
+    "sshx-x86_64-unknown-linux-musl.tar.gz"
+)
+
+GITHUB_API = "https://api.github.com"
+
+DEFAULT_GITHUB_REPO = "vipspots4me-hue/sfl"
+DEFAULT_GITHUB_BRANCH = "main"
+DEFAULT_PERSISTENT_BRANCH = "shl-persistent"
+
+PERSISTENT_BRANCH = os.environ.get(
+    "GITHUB_STATE_BRANCH",
+    DEFAULT_PERSISTENT_BRANCH,
+)
+
+CHUNK_SIZE = 45 * 1024 * 1024
+
+AUTO_BACKUP_INTERVAL = 15 * 60
+
+REQUEST_TIMEOUT = 120
+
+VOLATILE_TOP_LEVEL = {
+    "proc",
+    "sys",
+    "dev",
+    "run",
+    "tmp",
+    "mnt",
+    "media",
+}
 
 
 # ============================================================
-# Logging
+# LOGGING
 # ============================================================
+
+LOG_FILE = STATE_DIR / "shl.log"
+
+STATE_DIR.mkdir(parents=True, exist_ok=True)
 
 logging.basicConfig(
     level=logging.INFO,
     format="[SHL] %(asctime)s %(levelname)s %(message)s",
+    handlers=[
+        logging.FileHandler(LOG_FILE),
+        logging.StreamHandler(sys.stdout),
+    ],
 )
 
-log = logging.getLogger("shl")
+logger = logging.getLogger(APP_NAME)
+
+
+def log(message):
+    logger.info(message)
 
 
 # ============================================================
-# Required Ubuntu packages
+# DIRECTORIES
 # ============================================================
 
-BASE_PACKAGES = [
+def ensure_dirs():
+    BASE_DIR.mkdir(parents=True, exist_ok=True)
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    PROOT_DIR.mkdir(parents=True, exist_ok=True)
+    RESTORE_DIR.mkdir(parents=True, exist_ok=True)
+
+
+ensure_dirs()
+
+
+# ============================================================
+# SECRETS
+# ============================================================
+
+def get_secret(name, default=None):
+    try:
+        if name in st.secrets:
+            return st.secrets[name]
+    except Exception:
+        pass
+
+    return os.environ.get(name, default)
+
+
+GITHUB_TOKEN = get_secret("GITHUB_TOKEN")
+GITHUB_REPO = get_secret(
+    "GITHUB_REPO",
+    DEFAULT_GITHUB_REPO,
+)
+GITHUB_BRANCH = get_secret(
+    "GITHUB_BRANCH",
+    DEFAULT_GITHUB_BRANCH,
+)
+
+if get_secret("GITHUB_STATE_BRANCH"):
+    PERSISTENT_BRANCH = get_secret("GITHUB_STATE_BRANCH")
+
+
+# ============================================================
+# FILE LOCK
+# ============================================================
+
+class FileLock:
+    def __init__(self, path, blocking=True):
+        self.path = Path(path)
+        self.blocking = blocking
+        self.fp = None
+
+    def __enter__(self):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+
+        self.fp = open(self.path, "a+")
+
+        if fcntl is not None:
+            flags = fcntl.LOCK_EX
+
+            if not self.blocking:
+                flags |= fcntl.LOCK_NB
+
+            try:
+                fcntl.flock(self.fp.fileno(), flags)
+            except BlockingIOError:
+                self.fp.close()
+                self.fp = None
+                raise
+
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if self.fp:
+            try:
+                if fcntl is not None:
+                    fcntl.flock(
+                        self.fp.fileno(),
+                        fcntl.LOCK_UN,
+                    )
+            finally:
+                self.fp.close()
+
+        self.fp = None
+
+
+# ============================================================
+# COMMAND HELPERS
+# ============================================================
+
+def run_command(
+    cmd,
+    check=True,
+    timeout=120,
+    cwd=None,
+    env=None,
+):
+    log("$ " + " ".join(map(str, cmd)))
+
+    result = subprocess.run(
+        cmd,
+        cwd=cwd,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        timeout=timeout,
+        check=False,
+    )
+
+    if result.stdout:
+        for line in result.stdout.rstrip().splitlines():
+            log(line)
+
+    if check and result.returncode != 0:
+        raise subprocess.CalledProcessError(
+            result.returncode,
+            cmd,
+            output=result.stdout,
+        )
+
+    return result
+
+
+def sha256_file(path):
+    h = hashlib.sha256()
+
+    with open(path, "rb") as f:
+        while True:
+            chunk = f.read(4 * 1024 * 1024)
+
+            if not chunk:
+                break
+
+            h.update(chunk)
+
+    return h.hexdigest()
+
+
+# ============================================================
+# DOWNLOAD
+# ============================================================
+
+def download_file(url, destination, timeout=300):
+    destination = Path(destination)
+
+    destination.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    log(f"Downloading {url}")
+
+    with requests.get(
+        url,
+        stream=True,
+        timeout=timeout,
+        headers={
+            "User-Agent": "SHL/3.0",
+        },
+    ) as response:
+
+        response.raise_for_status()
+
+        total = int(
+            response.headers.get(
+                "content-length",
+                "0",
+            )
+        )
+
+        downloaded = 0
+
+        with open(destination, "wb") as f:
+            for chunk in response.iter_content(
+                chunk_size=1024 * 1024
+            ):
+                if not chunk:
+                    continue
+
+                f.write(chunk)
+                downloaded += len(chunk)
+
+                if total:
+                    percent = downloaded * 100 / total
+
+                    if (
+                        downloaded == len(chunk)
+                        or downloaded % (20 * 1024 * 1024)
+                        < len(chunk)
+                    ):
+                        log(
+                            f"Download progress: "
+                            f"{percent:.1f}%"
+                        )
+
+    return destination
+
+
+# ============================================================
+# GITHUB API
+# ============================================================
+
+def github_headers():
+    if not GITHUB_TOKEN:
+        raise RuntimeError(
+            "GITHUB_TOKEN is missing."
+        )
+
+    return {
+        "Authorization": f"Bearer {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": "SHL-Persistent/3.0",
+    }
+
+
+def github_request(
+    method,
+    path,
+    payload=None,
+    timeout=120,
+):
+    url = GITHUB_API + path
+
+    response = requests.request(
+        method,
+        url,
+        headers=github_headers(),
+        json=payload,
+        timeout=timeout,
+    )
+
+    if response.status_code >= 400:
+        raise RuntimeError(
+            f"GitHub API {method} {path} failed: "
+            f"{response.status_code} "
+            f"{response.text[:1000]}"
+        )
+
+    if not response.content:
+        return None
+
+    return response.json()
+
+
+def github_repo_exists():
+    try:
+        github_request(
+            "GET",
+            f"/repos/{GITHUB_REPO}",
+        )
+        return True
+    except Exception:
+        return False
+
+
+def github_branch_exists(branch):
+    try:
+        github_request(
+            "GET",
+            f"/repos/{GITHUB_REPO}/git/ref/heads/{branch}",
+        )
+        return True
+    except Exception:
+        return False
+
+
+def github_default_branch_sha():
+    data = github_request(
+        "GET",
+        f"/repos/{GITHUB_REPO}/git/ref/heads/{GITHUB_BRANCH}",
+    )
+
+    return data["object"]["sha"]
+
+
+def create_persistent_branch():
+    if github_branch_exists(PERSISTENT_BRANCH):
+        return
+
+    log(
+        f"Creating persistent branch: "
+        f"{PERSISTENT_BRANCH}"
+    )
+
+    sha = github_default_branch_sha()
+
+    github_request(
+        "POST",
+        f"/repos/{GITHUB_REPO}/git/refs",
+        {
+            "ref": f"refs/heads/{PERSISTENT_BRANCH}",
+            "sha": sha,
+        },
+    )
+
+
+def github_get_file(path, branch=PERSISTENT_BRANCH):
+    try:
+        return github_request(
+            "GET",
+            f"/repos/{GITHUB_REPO}/contents/{path}"
+            f"?ref={branch}",
+        )
+    except Exception:
+        return None
+
+
+def github_put_file(
+    path,
+    content,
+    message,
+    branch=PERSISTENT_BRANCH,
+    sha=None,
+):
+    if isinstance(content, str):
+        raw = content.encode()
+    else:
+        raw = content
+
+    encoded = base64.b64encode(raw).decode()
+
+    payload = {
+        "message": message,
+        "content": encoded,
+        "branch": branch,
+    }
+
+    if sha:
+        payload["sha"] = sha
+
+    return github_request(
+        "PUT",
+        f"/repos/{GITHUB_REPO}/contents/{path}",
+        payload,
+        timeout=300,
+    )
+
+
+def github_delete_file(
+    path,
+    message,
+    branch=PERSISTENT_BRANCH,
+):
+    current = github_get_file(
+        path,
+        branch,
+    )
+
+    if not current:
+        return
+
+    github_request(
+        "DELETE",
+        f"/repos/{GITHUB_REPO}/contents/{path}",
+        {
+            "message": message,
+            "sha": current["sha"],
+            "branch": branch,
+        },
+    )
+
+
+# ============================================================
+# MANIFEST
+# ============================================================
+
+MANIFEST_PATH = ".shl/manifest.json"
+
+
+def load_manifest():
+    if not GITHUB_TOKEN:
+        return None
+
+    data = github_get_file(
+        MANIFEST_PATH,
+        PERSISTENT_BRANCH,
+    )
+
+    if not data:
+        return None
+
+    try:
+        raw = base64.b64decode(
+            data["content"]
+        )
+
+        return json.loads(
+            raw.decode("utf-8")
+        )
+
+    except Exception as exc:
+        log(
+            f"Cannot parse manifest: {exc}"
+        )
+
+        return None
+
+
+# ============================================================
+# SNAPSHOT FILTER
+# ============================================================
+
+def snapshot_filter(tarinfo):
+    """
+    IMPORTANT:
+    TarInfo has no issock() method.
+    """
+
+    name = tarinfo.name.strip("/")
+
+    if not name:
+        return tarinfo
+
+    first = name.split("/", 1)[0]
+
+    if first in VOLATILE_TOP_LEVEL:
+        return None
+
+    if (
+        name == "var/cache/apt"
+        or name.startswith("var/cache/apt/")
+    ):
+        return None
+
+    if (
+        name == "var/lib/apt/lists"
+        or name.startswith("var/lib/apt/lists/")
+    ):
+        return None
+
+    if tarinfo.ischr():
+        return None
+
+    if tarinfo.isblk():
+        return None
+
+    return tarinfo
+
+
+# ============================================================
+# CREATE SNAPSHOT
+# ============================================================
+
+def create_snapshot():
+    if not ROOTFS_DIR.exists():
+        raise RuntimeError(
+            "Ubuntu rootfs does not exist."
+        )
+
+    log("Creating Ubuntu snapshot...")
+
+    SNAPSHOT_FILE.unlink(
+        missing_ok=True
+    )
+
+    started = time.time()
+
+    with tarfile.open(
+        SNAPSHOT_FILE,
+        "w:gz",
+        compresslevel=6,
+    ) as tar:
+
+        tar.add(
+            ROOTFS_DIR,
+            arcname=".",
+            recursive=True,
+            filter=snapshot_filter,
+        )
+
+    size = SNAPSHOT_FILE.stat().st_size
+
+    elapsed = time.time() - started
+
+    digest = sha256_file(
+        SNAPSHOT_FILE
+    )
+
+    log(
+        f"Ubuntu snapshot created: "
+        f"{size / 1024 / 1024:.2f} MB"
+    )
+
+    log(
+        f"Snapshot SHA256: {digest}"
+    )
+
+    log(
+        f"Snapshot time: {elapsed:.1f}s"
+    )
+
+    return SNAPSHOT_FILE
+
+
+# ============================================================
+# UPLOAD SNAPSHOT
+# ============================================================
+
+def upload_snapshot(snapshot):
+    if not GITHUB_TOKEN:
+        raise RuntimeError(
+            "GITHUB_TOKEN is missing."
+        )
+
+    create_persistent_branch()
+
+    snapshot_id = datetime.now(
+        timezone.utc
+    ).strftime(
+        "%Y%m%d-%H%M%S"
+    )
+
+    snapshot_dir = (
+        f".shl/snapshots/{snapshot_id}"
+    )
+
+    size = snapshot.stat().st_size
+
+    total_parts = (
+        size + CHUNK_SIZE - 1
+    ) // CHUNK_SIZE
+
+    digest = sha256_file(
+        snapshot
+    )
+
+    log(
+        f"Uploading snapshot "
+        f"{snapshot_id}"
+    )
+
+    log(
+        f"Snapshot size: "
+        f"{size / 1024 / 1024:.2f} MB"
+    )
+
+    log(
+        f"Parts: {total_parts}"
+    )
+
+    parts = []
+
+    with open(snapshot, "rb") as f:
+
+        for index in range(total_parts):
+
+            data = f.read(
+                CHUNK_SIZE
+            )
+
+            if not data:
+                break
+
+            filename = (
+                f"part-{index:05d}"
+            )
+
+            path = (
+                f"{snapshot_dir}/{filename}"
+            )
+
+            log(
+                f"Uploading "
+                f"{index + 1}/{total_parts}: "
+                f"{filename}"
+            )
+
+            github_put_file(
+                path,
+                data,
+                (
+                    f"SHL snapshot "
+                    f"{snapshot_id} "
+                    f"part {index + 1}/{total_parts}"
+                ),
+                branch=PERSISTENT_BRANCH,
+            )
+
+            parts.append(
+                {
+                    "index": index,
+                    "path": path,
+                    "size": len(data),
+                    "sha256": hashlib.sha256(
+                        data
+                    ).hexdigest(),
+                }
+            )
+
+    manifest = {
+        "version": 1,
+        "created_at": datetime.now(
+            timezone.utc
+        ).isoformat(),
+        "snapshot_id": snapshot_id,
+        "archive": "ubuntu-snapshot.tar.gz",
+        "archive_size": size,
+        "archive_sha256": digest,
+        "chunk_size": CHUNK_SIZE,
+        "parts": parts,
+        "rootfs": "ubuntu-22.04.5-amd64",
+        "app_version": APP_VERSION,
+    }
+
+    github_put_file(
+        MANIFEST_PATH,
+        json.dumps(
+            manifest,
+            indent=2,
+        ),
+        (
+            f"SHL manifest "
+            f"{snapshot_id}"
+        ),
+        branch=PERSISTENT_BRANCH,
+    )
+
+    log(
+        "Persistent GitHub snapshot uploaded."
+    )
+
+    return manifest
+
+
+# ============================================================
+# BACKUP
+# ============================================================
+
+def write_backup_state(data):
+    BACKUP_STATE_FILE.write_text(
+        json.dumps(
+            data,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+
+def backup_now(reason="manual"):
+    if not GITHUB_TOKEN:
+        log(
+            "Backup skipped: "
+            "GITHUB_TOKEN is missing."
+        )
+        return False
+
+    try:
+        lock = FileLock(
+            BACKUP_LOCK_FILE,
+            blocking=False,
+        )
+
+        lock.__enter__()
+
+    except BlockingIOError:
+        log(
+            "Backup already running "
+            "in another process."
+        )
+        return False
+
+    try:
+        log(
+            f"Starting persistent "
+            f"GitHub backup: {reason}"
+        )
+
+        write_backup_state(
+            {
+                "status": "running",
+                "reason": reason,
+                "started_at": datetime.now(
+                    timezone.utc
+                ).isoformat(),
+            }
+        )
+
+        snapshot = create_snapshot()
+
+        manifest = upload_snapshot(
+            snapshot
+        )
+
+        write_backup_state(
+            {
+                "status": "success",
+                "reason": reason,
+                "finished_at": datetime.now(
+                    timezone.utc
+                ).isoformat(),
+                "snapshot_id": manifest[
+                    "snapshot_id"
+                ],
+                "size": manifest[
+                    "archive_size"
+                ],
+                "sha256": manifest[
+                    "archive_sha256"
+                ],
+            }
+        )
+
+        return True
+
+    except Exception as exc:
+
+        log(
+            f"Backup failed: {exc}"
+        )
+
+        write_backup_state(
+            {
+                "status": "failed",
+                "reason": reason,
+                "finished_at": datetime.now(
+                    timezone.utc
+                ).isoformat(),
+                "error": str(exc),
+            }
+        )
+
+        return False
+
+    finally:
+        try:
+            lock.__exit__(
+                None,
+                None,
+                None,
+            )
+        except Exception:
+            pass
+
+
+# ============================================================
+# RESTORE
+# ============================================================
+
+def download_github_file(
+    path,
+    branch=PERSISTENT_BRANCH,
+):
+    data = github_get_file(
+        path,
+        branch,
+    )
+
+    if not data:
+        raise RuntimeError(
+            f"GitHub file not found: {path}"
+        )
+
+    raw = base64.b64decode(
+        data["content"]
+    )
+
+    return raw
+
+
+def restore_snapshot(manifest):
+    log(
+        "Restoring Ubuntu from "
+        "persistent GitHub snapshot..."
+    )
+
+    restore_root = (
+        RESTORE_DIR / "ubuntu"
+    )
+
+    if restore_root.exists():
+        shutil.rmtree(
+            restore_root,
+            ignore_errors=True,
+        )
+
+    restore_root.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    archive = (
+        RESTORE_DIR /
+        "ubuntu-snapshot.tar.gz"
+    )
+
+    with open(archive, "wb") as out:
+
+        for part in sorted(
+            manifest["parts"],
+            key=lambda x: x["index"],
+        ):
+
+            log(
+                f"Downloading snapshot part "
+                f"{part['index'] + 1}/"
+                f"{len(manifest['parts'])}"
+            )
+
+            data = download_github_file(
+                part["path"]
+            )
+
+            actual_sha = hashlib.sha256(
+                data
+            ).hexdigest()
+
+            if actual_sha != part["sha256"]:
+                raise RuntimeError(
+                    "Snapshot chunk SHA256 "
+                    "verification failed."
+                )
+
+            out.write(data)
+
+    actual_archive_sha = sha256_file(
+        archive
+    )
+
+    if (
+        actual_archive_sha
+        != manifest["archive_sha256"]
+    ):
+        raise RuntimeError(
+            "Full snapshot SHA256 "
+            "verification failed."
+        )
+
+    log(
+        "Snapshot SHA256 verified."
+    )
+
+    log(
+        "Extracting Ubuntu snapshot..."
+    )
+
+    with tarfile.open(
+        archive,
+        "r:gz",
+    ) as tar:
+
+        tar.extractall(
+            restore_root
+        )
+
+    if ROOTFS_DIR.exists():
+        shutil.rmtree(
+            ROOTFS_DIR,
+            ignore_errors=True,
+        )
+
+    ROOTFS_DIR.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    shutil.move(
+        str(restore_root),
+        str(ROOTFS_DIR),
+    )
+
+    log(
+        "Ubuntu snapshot restored."
+    )
+
+    archive.unlink(
+        missing_ok=True
+    )
+
+
+# ============================================================
+# UBUNTU BASE INSTALL
+# ============================================================
+
+def extract_ubuntu_base():
+    archive = (
+        BASE_DIR /
+        "ubuntu-base.tar.gz"
+    )
+
+    if ROOTFS_DIR.exists():
+        log(
+            "Ubuntu rootfs already exists."
+        )
+        return
+
+    log(
+        "Downloading Ubuntu 22.04.5 base..."
+    )
+
+    download_file(
+        UBUNTU_URL,
+        archive,
+        timeout=600,
+    )
+
+    ROOTFS_DIR.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    log(
+        "Extracting Ubuntu base..."
+    )
+
+    with tarfile.open(
+        archive,
+        "r:gz",
+    ) as tar:
+
+        tar.extractall(
+            ROOTFS_DIR
+        )
+
+    archive.unlink(
+        missing_ok=True
+    )
+
+    log(
+        "Ubuntu base extracted."
+    )
+
+
+# ============================================================
+# PROOT
+# ============================================================
+
+def install_proot():
+    proot_path = (
+        PROOT_DIR / "proot"
+    )
+
+    if (
+        proot_path.exists()
+        and os.access(
+            proot_path,
+            os.X_OK,
+        )
+    ):
+        return proot_path
+
+    archive = (
+        PROOT_DIR /
+        "proot-amd64"
+    )
+
+    log(
+        "Downloading PRoot..."
+    )
+
+    download_file(
+        PROOT_URL,
+        archive,
+        timeout=300,
+    )
+
+    shutil.copy2(
+        archive,
+        proot_path,
+    )
+
+    proot_path.chmod(0o755)
+
+    archive.unlink(
+        missing_ok=True
+    )
+
+    return proot_path
+
+
+# ============================================================
+# PRoot COMMAND
+# ============================================================
+
+def proot_command(
+    command,
+    check=True,
+    timeout=300,
+):
+    proot_path = install_proot()
+
+    if isinstance(command, str):
+        command = [
+            "/bin/bash",
+            "-lc",
+            command,
+        ]
+
+    env = os.environ.copy()
+
+    env["HOME"] = "/root"
+    env["USER"] = "root"
+    env["LOGNAME"] = "root"
+    env["PATH"] = (
+        "/root/.local/bin:"
+        "/usr/local/sbin:"
+        "/usr/local/bin:"
+        "/usr/sbin:"
+        "/usr/bin:"
+        "/sbin:"
+        "/bin"
+    )
+
+    cmd = [
+        str(proot_path),
+        "-0",
+        "-r",
+        str(ROOTFS_DIR),
+
+        "-b",
+        "/dev",
+
+        "-b",
+        "/dev/pts",
+
+        "-b",
+        "/proc",
+
+        "-b",
+        "/sys",
+
+        "-b",
+        "/etc/resolv.conf:"
+        "/etc/resolv.conf",
+
+        "-w",
+        "/root",
+
+        "/usr/bin/env",
+        "-i",
+
+        f"HOME={env['HOME']}",
+        f"USER={env['USER']}",
+        f"LOGNAME={env['LOGNAME']}",
+        f"PATH={env['PATH']}",
+
+        "TERM=xterm-256color",
+
+        *command,
+    ]
+
+    return run_command(
+        cmd,
+        check=check,
+        timeout=timeout,
+        env=os.environ.copy(),
+    )
+
+
+# ============================================================
+# UBUNTU CONFIGURATION
+# ============================================================
+
+def configure_ubuntu():
+    etc = ROOTFS_DIR / "etc"
+
+    etc.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    hostname = (
+        etc / "hostname"
+    )
+
+    hostname.write_text(
+        "shl\n",
+        encoding="utf-8",
+    )
+
+    hosts = (
+        etc / "hosts"
+    )
+
+    hosts.write_text(
+        "127.0.0.1 localhost\n"
+        "127.0.1.1 shl\n"
+        "::1 localhost ip6-localhost "
+        "ip6-loopback\n",
+        encoding="utf-8",
+    )
+
+
+# ============================================================
+# UBUNTU PACKAGES
+# ============================================================
+
+UBUNTU_PACKAGES = [
     "bash",
     "ca-certificates",
     "curl",
@@ -136,1419 +1240,84 @@ BASE_PACKAGES = [
     "xz-utils",
     "bzip2",
     "zip",
-    "unzip",
+    "screen",
+    "tmux",
 ]
 
 
-# ============================================================
-# Generic helpers
-# ============================================================
-
-def ensure_dirs():
-    BASE_DIR.mkdir(parents=True, exist_ok=True)
-    ROOTFS_DIR.parent.mkdir(parents=True, exist_ok=True)
-    PROOT_DIR.mkdir(parents=True, exist_ok=True)
-    RESTORE_DIR.mkdir(parents=True, exist_ok=True)
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
-    SSHX_DIR.mkdir(parents=True, exist_ok=True)
-    SERVICE_DIR.mkdir(parents=True, exist_ok=True)
-
-
-def now_iso():
-    return datetime.now(timezone.utc).isoformat()
-
-
-def calculate_sha256(path):
-    h = hashlib.sha256()
-
-    with open(path, "rb") as f:
-        while True:
-            data = f.read(1024 * 1024)
-
-            if not data:
-                break
-
-            h.update(data)
-
-    return h.hexdigest()
-
-
-def atomic_write_text(path, text):
-    path = Path(path)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-
-    tmp.write_text(
-        text,
-        encoding="utf-8",
-    )
-
-    tmp.replace(path)
-
-
-def atomic_write_json(path, obj):
-    atomic_write_text(
-        path,
-        json.dumps(
-            obj,
-            indent=2,
-            ensure_ascii=False,
-        ),
-    )
-
-
-def load_json(path, default=None):
-    try:
-        return json.loads(
-            Path(path).read_text(
-                encoding="utf-8"
-            )
-        )
-    except Exception:
-        return default
-
-
-# ============================================================
-# Streamlit Secrets
-# ============================================================
-
-def get_secret(name, default=""):
-    try:
-        value = st.secrets.get(name)
-
-        if value is not None:
-            return str(value)
-
-    except Exception:
-        pass
-
-    return os.environ.get(
-        name,
-        default,
-    )
-
-
-def github_token():
-    return get_secret(
-        "GITHUB_TOKEN"
-    ).strip()
-
-
-# ============================================================
-# GitHub API
-# ============================================================
-
-def github_request(
-    method,
-    path,
-    payload=None,
-    timeout=60,
-):
-    token = github_token()
-
-    if not token:
-        raise RuntimeError(
-            "GITHUB_TOKEN is missing."
-        )
-
-    url = GITHUB_API + path
-
-    headers = {
-        "Accept": "application/vnd.github+json",
-        "Authorization": f"Bearer {token}",
-        "X-GitHub-Api-Version": "2026-03-10",
-        "User-Agent": "SHL-Persistent-Server",
-    }
-
-    data = None
-
-    if payload is not None:
-        data = json.dumps(
-            payload
-        ).encode("utf-8")
-
-        headers["Content-Type"] = (
-            "application/json"
-        )
-
-    req = urllib.request.Request(
-        url,
-        data=data,
-        headers=headers,
-        method=method,
-    )
-
-    try:
-        with urllib.request.urlopen(
-            req,
-            timeout=timeout,
-        ) as response:
-
-            raw = response.read()
-
-            if not raw:
-                return {}
-
-            return json.loads(
-                raw.decode("utf-8")
-            )
-
-    except urllib.error.HTTPError as e:
-
-        body = ""
-
-        try:
-            body = e.read().decode(
-                "utf-8",
-                errors="replace",
-            )
-        except Exception:
-            pass
-
-        raise RuntimeError(
-            f"GitHub API {e.code}: {body[:1000]}"
-        )
-
-
-def github_repo_info():
-    return github_request(
-        "GET",
-        f"/repos/{GITHUB_REPO}",
-    )
-
-
-def github_branch_exists(branch):
-    try:
-        github_request(
-            "GET",
-            f"/repos/{GITHUB_REPO}/branches/"
-            f"{branch}",
-        )
-
-        return True
-
-    except Exception:
-        return False
-
-
-def github_default_branch_sha():
-    info = github_repo_info()
-
-    branch = info.get(
-        "default_branch",
-        GITHUB_BRANCH,
-    )
-
-    result = github_request(
-        "GET",
-        f"/repos/{GITHUB_REPO}/branches/{branch}",
-    )
-
-    return (
-        result["commit"]["sha"],
-        branch,
-    )
-
-
-def create_persistent_branch():
-    if github_branch_exists(
-        PERSISTENT_BRANCH
-    ):
-        return
-
-    main_sha, _ = (
-        github_default_branch_sha()
-    )
-
-    log.info(
-        "Creating persistent branch %s",
-        PERSISTENT_BRANCH,
-    )
-
-    github_request(
-        "POST",
-        f"/repos/{GITHUB_REPO}/git/refs",
-        {
-            "ref": f"refs/heads/{PERSISTENT_BRANCH}",
-            "sha": main_sha,
-        },
-    )
-
-
-def github_get_file(path):
-    try:
-        return github_request(
-            "GET",
-            f"/repos/{GITHUB_REPO}/contents/"
-            f"{path}?ref={PERSISTENT_BRANCH}",
-        )
-
-    except Exception:
-        return None
-
-
-def github_put_file(
-    path,
-    content_bytes,
-    message,
-):
-    encoded = base64.b64encode(
-        content_bytes
-    ).decode("ascii")
-
-    existing = github_get_file(
-        path
-    )
-
-    payload = {
-        "message": message,
-        "content": encoded,
-        "branch": PERSISTENT_BRANCH,
-        "committer": {
-            "name": "SHL Persistent Server",
-            "email": "shl@users.noreply.github.com",
-        },
-    }
-
-    if existing and existing.get("sha"):
-        payload["sha"] = existing["sha"]
-
-    return github_request(
-        "PUT",
-        f"/repos/{GITHUB_REPO}/contents/"
-        f"{path}",
-        payload,
-        timeout=120,
-    )
-
-
-def github_delete_file(
-    path,
-    message,
-):
-    existing = github_get_file(
-        path
-    )
-
-    if not existing:
-        return
-
-    sha = existing.get("sha")
-
-    if not sha:
-        return
-
-    github_request(
-        "DELETE",
-        f"/repos/{GITHUB_REPO}/contents/"
-        f"{path}",
-        {
-            "message": message,
-            "sha": sha,
-            "branch": PERSISTENT_BRANCH,
-            "committer": {
-                "name": "SHL Persistent Server",
-                "email": "shl@users.noreply.github.com",
-            },
-        },
-    )
-
-
-# ============================================================
-# Ubuntu / PRoot download
-# ============================================================
-
-def download_file(
-    url,
-    destination,
-):
-    destination = Path(destination)
-
-    destination.parent.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    log.info(
-        "Downloading %s",
-        url,
-    )
-
-    tmp = destination.with_suffix(
-        destination.suffix + ".tmp"
-    )
-
-    with urllib.request.urlopen(
-        url,
-        timeout=300,
-    ) as response:
-
-        with open(
-            tmp,
-            "wb",
-        ) as f:
-
-            while True:
-                data = response.read(
-                    1024 * 1024
-                )
-
-                if not data:
-                    break
-
-                f.write(data)
-
-    tmp.replace(destination)
-
-
-def install_proot():
-    ensure_dirs()
-
-    proot_path = PROOT_DIR / "proot"
-
-    if proot_path.exists():
-        proot_path.chmod(0o755)
-
-        log.info(
-            "PRoot already installed."
-        )
-
-        return proot_path
-
-    log.info(
-        "Downloading PRoot..."
-    )
-
-    download_file(
-        PROOT_URL,
-        proot_path,
-    )
-
-    proot_path.chmod(0o755)
-
-    return proot_path
-
-
-# ============================================================
-# Ubuntu rootfs
-# ============================================================
-
-def rootfs_exists():
-    return (
-        ROOTFS_DIR.exists()
-        and (ROOTFS_DIR / "bin").exists()
-        and (ROOTFS_DIR / "etc").exists()
-        and (ROOTFS_DIR / "usr").exists()
-    )
-
-
-def extract_ubuntu():
-    ensure_dirs()
-
-    if rootfs_exists():
-        return
-
-    archive = BASE_DIR / (
-        "ubuntu-base.tar.gz"
-    )
-
-    log.info(
-        "Ubuntu rootfs not found."
-    )
-
-    if not archive.exists():
-        download_file(
-            UBUNTU_URL,
-            archive,
-        )
-
-    ROOTFS_DIR.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    log.info(
-        "Extracting Ubuntu %s...",
-        UBUNTU_VERSION,
-    )
-
-    with tarfile.open(
-        archive,
-        "r:gz",
-    ) as tar:
-
-        tar.extractall(
-            ROOTFS_DIR
-        )
-
-    try:
-        archive.unlink()
-    except Exception:
-        pass
-
-
-# ============================================================
-# PRoot execution
-# ============================================================
-
-def run_ubuntu(
-    command,
-    check=True,
-    timeout=600,
-    capture=True,
-):
-    install_proot()
-    extract_ubuntu()
-
-    env = os.environ.copy()
-
-    env.update(
-        {
-            "HOME": "/root",
-            "USER": "root",
-            "LOGNAME": "root",
-            "PATH": (
-                "/usr/local/sbin:"
-                "/usr/local/bin:"
-                "/usr/sbin:"
-                "/usr/bin:"
-                "/sbin:"
-                "/bin"
-            ),
-            "TERM": "xterm-256color",
-            "LANG": "C.UTF-8",
-        }
-    )
-
-    cmd = [
-        str(PROOT_DIR / "proot"),
-        "-0",
-        "-r",
-        str(ROOTFS_DIR),
-        "-b",
-        "/dev",
-        "-b",
-        "/dev/pts",
-        "-b",
-        "/proc",
-        "-b",
-        "/sys",
-        "-b",
-        "/etc/resolv.conf:/etc/resolv.conf",
-        "-w",
-        "/root",
-        "/usr/bin/env",
-        "-i",
-        "HOME=/root",
-        "USER=root",
-        "LOGNAME=root",
-        (
-            "PATH=/usr/local/sbin:"
-            "/usr/local/bin:"
-            "/usr/sbin:"
-            "/usr/bin:"
-            "/sbin:"
-            "/bin"
-        ),
-        "TERM=xterm-256color",
-        "LANG=C.UTF-8",
-        "/bin/bash",
-        "-lc",
-        command,
-    ]
-
-    log.info(
-        "$ %s",
-        " ".join(cmd),
-    )
-
-    result = subprocess.run(
-        cmd,
-        env=env,
-        capture_output=capture,
-        text=True,
-        timeout=timeout,
-    )
-
-    if capture:
-
-        if result.stdout:
-            for line in result.stdout.splitlines():
-                log.info(
-                    "UBUNTU: %s",
-                    line,
-                )
-
-        if result.stderr:
-            for line in result.stderr.splitlines():
-                log.info(
-                    "UBUNTU: %s",
-                    line,
-                )
-
-    if check and result.returncode != 0:
-        raise RuntimeError(
-            f"Ubuntu command failed: "
-            f"{result.returncode}"
-        )
-
-    return result
-
-
-# ============================================================
-# Ubuntu configuration
-# ============================================================
-
-def configure_ubuntu():
-    extract_ubuntu()
-
-    etc = ROOTFS_DIR / "etc"
-
-    hostname = etc / "hostname"
-    hosts = etc / "hosts"
-    resolv = etc / "resolv.conf"
-
-    if not hostname.exists():
-        hostname.write_text(
-            "localhost\n",
-            encoding="utf-8",
-        )
-
-    if not hosts.exists():
-        hosts.write_text(
-            "127.0.0.1 localhost\n"
-            "127.0.1.1 localhost\n"
-            "::1 localhost ip6-localhost ip6-loopback\n",
-            encoding="utf-8",
-        )
-
-    # Do not replace existing resolv.conf.
-    if not resolv.exists():
-        try:
-            resolv.write_text(
-                "nameserver 1.1.1.1\n"
-                "nameserver 8.8.8.8\n",
-                encoding="utf-8",
-            )
-        except Exception:
-            pass
-
-
-# ============================================================
-# Base packages
-# ============================================================
-
 def install_base_packages():
-    extract_ubuntu()
-    configure_ubuntu()
+    marker = (
+        ROOTFS_DIR /
+        "var/lib/shl-base-installed"
+    )
 
-    if BASE_PACKAGES_MARKER.exists():
-        log.info(
+    if marker.exists():
+        log(
             "Base packages already installed."
         )
         return
 
-    package_string = " ".join(
-        BASE_PACKAGES
-    )
-
-    log.info(
+    log(
         "Installing Ubuntu base packages..."
     )
 
-    run_ubuntu(
+    command = (
         "export DEBIAN_FRONTEND=noninteractive; "
         "apt-get update && "
-        f"apt-get install -y {package_string}",
-        timeout=1800,
+        "apt-get install -y "
+        + " ".join(
+            UBUNTU_PACKAGES
+        )
     )
 
-    BASE_PACKAGES_MARKER.parent.mkdir(
+    proot_command(
+        command,
+        check=True,
+        timeout=900,
+    )
+
+    marker.parent.mkdir(
         parents=True,
         exist_ok=True,
     )
 
-    BASE_PACKAGES_MARKER.write_text(
-        now_iso(),
+    marker.write_text(
+        datetime.now(
+            timezone.utc
+        ).isoformat(),
         encoding="utf-8",
     )
 
-    log.info(
+    log(
         "Base packages installed."
     )
 
 
 # ============================================================
-# Ubuntu diagnostic
+# UBUNTU TEST
 # ============================================================
 
-def ubuntu_test():
-    result = run_ubuntu(
-        """
-echo SHL_UBUNTU_OK
-echo USER=$(id -un)
-echo UID=$(id -u)
-echo OS=$(grep PRETTY_NAME /etc/os-release)
-echo ARCH=$(uname -m)
-""".strip(),
-        check=True,
-        timeout=120,
-    )
-
-    return result.stdout
-
-
-# ============================================================
-# Snapshot exclusion rules
-# ============================================================
-
-EXCLUDED_TOP_LEVEL = {
-    "proc",
-    "sys",
-    "dev",
-    "run",
-    "tmp",
-    "mnt",
-    "media",
-}
-
-
-EXCLUDED_RELATIVE = {
-    "var/cache/apt",
-    "var/lib/apt/lists",
-    "var/cache/debconf",
-    "var/log/journal",
-}
-
-
-def snapshot_filter(tarinfo):
-    name = tarinfo.name.strip("/")
-
-    if not name:
-        return tarinfo
-
-    parts = name.split("/")
-
-    if parts[0] in EXCLUDED_TOP_LEVEL:
-        return None
-
-    for excluded in EXCLUDED_RELATIVE:
-
-        if (
-            name == excluded
-            or name.startswith(
-                excluded + "/"
-            )
-        ):
-            return None
-
-    # Skip socket files.
-    if tarinfo.ischr() or tarinfo.isblk():
-        return None
-
-    if tarinfo.issock():
-        return None
-
-    return tarinfo
-
-
-# ============================================================
-# Snapshot creation
-# ============================================================
-
-def create_snapshot():
-    ensure_dirs()
-
-    snapshot = (
-        BASE_DIR /
-        "ubuntu-snapshot.tar.gz"
-    )
-
-    if snapshot.exists():
-        snapshot.unlink()
-
-    log.info(
-        "Creating Ubuntu snapshot..."
-    )
-
-    with tarfile.open(
-        snapshot,
-        mode="w:gz",
-        compresslevel=6,
-    ) as tar:
-
-        tar.add(
-            ROOTFS_DIR,
-            arcname=".",
-            recursive=True,
-            filter=snapshot_filter,
-        )
-
-    size = snapshot.stat().st_size
-
-    sha = calculate_sha256(
-        snapshot
-    )
-
-    log.info(
-        "Snapshot created: %.2f MB",
-        size / 1024 / 1024,
-    )
-
-    log.info(
-        "Snapshot SHA256: %s",
-        sha,
-    )
-
-    return snapshot, sha
-
-
-# ============================================================
-# GitHub persistent snapshot
-# ============================================================
-
-def chunk_file(path):
-    chunks = []
-
-    with open(
-        path,
-        "rb",
-    ) as f:
-
-        index = 0
-
-        while True:
-
-            data = f.read(
-                CHUNK_SIZE
-            )
-
-            if not data:
-                break
-
-            chunks.append(
-                (
-                    index,
-                    data,
-                )
-            )
-
-            index += 1
-
-    return chunks
-
-
-def cleanup_old_snapshot_files():
-    """
-    Delete old snapshot chunk files from the
-    persistent branch.
-
-    Git history remains in GitHub, but the active
-    branch only exposes the latest snapshot.
-    """
-
-    try:
-        contents = github_request(
-            "GET",
-            f"/repos/{GITHUB_REPO}/contents/"
-            f".shl/snapshots"
-            f"?ref={PERSISTENT_BRANCH}",
-        )
-
-    except Exception:
-        return
-
-    if not isinstance(
-        contents,
-        list,
-    ):
-        return
-
-    for item in contents:
-
-        name = item.get(
-            "name",
-            "",
-        )
-
-        path = item.get(
-            "path",
-            "",
-        )
-
-        if not name.startswith(
-            "ubuntu-"
-        ):
-            continue
-
-        try:
-            github_delete_file(
-                path,
-                "Remove old SHL snapshot",
-            )
-
-        except Exception as e:
-            log.warning(
-                "Could not delete %s: %s",
-                path,
-                e,
-            )
-
-
-def upload_snapshot(
-    snapshot,
-    sha,
-):
-    create_persistent_branch()
-
-    log.info(
-        "Preparing GitHub snapshot..."
-    )
-
-    chunks = chunk_file(
-        snapshot
-    )
-
-    log.info(
-        "Snapshot contains %d chunks.",
-        len(chunks),
-    )
-
-    # Remove active old chunks first.
-    cleanup_old_snapshot_files()
-
-    uploaded = []
-
-    timestamp = datetime.now(
-        timezone.utc
-    ).strftime(
-        "%Y%m%d-%H%M%S"
-    )
-
-    for index, data in chunks:
-
-        filename = (
-            f"ubuntu-{timestamp}-"
-            f"{index:05d}.part"
-        )
-
-        path = (
-            ".shl/snapshots/"
-            + filename
-        )
-
-        log.info(
-            "Uploading chunk %d/%d: %s",
-            index + 1,
-            len(chunks),
-            filename,
-        )
-
-        github_put_file(
-            path,
-            data,
+def test_ubuntu():
+    result = proot_command(
+        [
+            "/bin/bash",
+            "-lc",
             (
-                f"SHL snapshot "
-                f"{timestamp} "
-                f"part {index + 1}/"
-                f"{len(chunks)}"
+                "echo SHL_UBUNTU_OK; "
+                "id; "
+                "cat /etc/os-release | "
+                "grep -E 'PRETTY_NAME|VERSION_ID'; "
+                "uname -m; "
+                "command -v python3 || true; "
+                "command -v git || true; "
+                "command -v curl || true"
             ),
-        )
-
-        uploaded.append(
-            {
-                "path": path,
-                "index": index,
-                "size": len(data),
-            }
-        )
-
-    manifest = {
-        "format": 1,
-        "created_at": now_iso(),
-        "repo": GITHUB_REPO,
-        "branch": PERSISTENT_BRANCH,
-        "source_branch": GITHUB_BRANCH,
-        "snapshot_sha256": sha,
-        "snapshot_size": snapshot.stat().st_size,
-        "chunk_size": CHUNK_SIZE,
-        "chunks": uploaded,
-        "ubuntu": UBUNTU_VERSION,
-    }
-
-    github_put_file(
-        ".shl/manifest.json",
-        json.dumps(
-            manifest,
-            indent=2,
-        ).encode("utf-8"),
-        (
-            "SHL persistent snapshot "
-            "manifest"
-        ),
+        ],
+        check=False,
+        timeout=60,
     )
 
-    state = {
-        "last_backup": now_iso(),
-        "snapshot_sha256": sha,
-        "snapshot_size": snapshot.stat().st_size,
-        "chunks": len(chunks),
-        "branch": PERSISTENT_BRANCH,
-    }
-
-    atomic_write_json(
-        BACKUP_STATE_FILE,
-        state,
-    )
-
-    log.info(
-        "Persistent GitHub backup completed."
-    )
-
-    return manifest
-
-
-# ============================================================
-# Restore from GitHub
-# ============================================================
-
-def download_github_file(
-    path,
-):
-    data = github_request(
-        "GET",
-        f"/repos/{GITHUB_REPO}/contents/"
-        f"{path}?ref={PERSISTENT_BRANCH}",
-    )
-
-    if data.get("encoding") != "base64":
-        raise RuntimeError(
-            "Unexpected GitHub file encoding."
-        )
-
-    content = data.get(
-        "content",
-        "",
-    )
-
-    content = (
-        content
-        .replace("\n", "")
-        .replace("\r", "")
-    )
-
-    return base64.b64decode(
-        content
-    )
-
-
-def restore_snapshot():
-    if not github_token():
-        log.warning(
-            "GITHUB_TOKEN missing; "
-            "cannot restore persistent state."
-        )
-
-        return False
-
-    if not github_branch_exists(
-        PERSISTENT_BRANCH
-    ):
-        log.info(
-            "No persistent state branch yet."
-        )
-
-        return False
-
-    manifest_data = github_get_file(
-        ".shl/manifest.json"
-    )
-
-    if not manifest_data:
-        log.info(
-            "No persistent manifest yet."
-        )
-
-        return False
-
-    try:
-        manifest_raw = base64.b64decode(
-            manifest_data["content"]
-            .replace("\n", "")
-        )
-
-        manifest = json.loads(
-            manifest_raw.decode(
-                "utf-8"
-            )
-        )
-
-    except Exception as e:
-        log.error(
-            "Invalid persistent manifest: %s",
-            e,
-        )
-
-        return False
-
-    chunks = manifest.get(
-        "chunks",
-        [],
-    )
-
-    if not chunks:
-        log.warning(
-            "Persistent manifest has no chunks."
-        )
-
-        return False
-
-    ensure_dirs()
-
-    archive = (
-        BASE_DIR /
-        "restored-ubuntu.tar.gz"
-    )
-
-    if archive.exists():
-        archive.unlink()
-
-    log.info(
-        "Restoring persistent Ubuntu from GitHub..."
-    )
-
-    chunks = sorted(
-        chunks,
-        key=lambda x: x["index"],
-    )
-
-    with open(
-        archive,
-        "wb",
-    ) as out:
-
-        for i, chunk in enumerate(
-            chunks
-        ):
-
-            path = chunk["path"]
-
-            log.info(
-                "Downloading chunk %d/%d",
-                i + 1,
-                len(chunks),
-            )
-
-            data = download_github_file(
-                path
-            )
-
-            out.write(data)
-
-    actual_sha = calculate_sha256(
-        archive
-    )
-
-    expected_sha = manifest.get(
-        "snapshot_sha256"
-    )
-
-    if (
-        expected_sha
-        and actual_sha != expected_sha
-    ):
-        archive.unlink(
-            missing_ok=True
-        )
-
-        raise RuntimeError(
-            "Persistent snapshot SHA256 "
-            "does not match."
-        )
-
-    # Never restore directly over the current
-    # rootfs. Build a new one first.
-    restored = (
-        RESTORE_DIR /
-        "ubuntu"
-    )
-
-    if restored.exists():
-        shutil.rmtree(
-            restored,
-            ignore_errors=True,
-        )
-
-    restored.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    log.info(
-        "Extracting persistent Ubuntu..."
-    )
-
-    with tarfile.open(
-        archive,
-        "r:gz",
-    ) as tar:
-
-        tar.extractall(
-            restored
-        )
-
-    # Basic integrity check.
-    if not (
-        (restored / "etc").exists()
-        and (restored / "usr").exists()
-        and (restored / "bin").exists()
-    ):
-        raise RuntimeError(
-            "Restored Ubuntu rootfs is invalid."
-        )
-
-    if ROOTFS_DIR.exists():
-        shutil.rmtree(
-            ROOTFS_DIR,
-            ignore_errors=True,
-        )
-
-    restored.rename(
-        ROOTFS_DIR
-    )
-
-    archive.unlink(
-        missing_ok=True
-    )
-
-    log.info(
-        "Persistent Ubuntu restored successfully."
-    )
-
-    return True
-
-
-# ============================================================
-# Backup controller
-# ============================================================
-
-class BackupController:
-
-    def __init__(self):
-        self.lock = threading.Lock()
-        self.running = False
-        self.pending = False
-        self.last_backup_time = 0
-        self.thread = None
-
-    def request(self, reason="change"):
-        with self.lock:
-            self.pending = True
-
-        if self.thread is None or not self.thread.is_alive():
-
-            self.thread = threading.Thread(
-                target=self.worker,
-                args=(reason,),
-                daemon=True,
-            )
-
-            self.thread.start()
-
-    def worker(self, reason):
-        time.sleep(
-            BACKUP_DEBOUNCE
-        )
-
-        while True:
-
-            with self.lock:
-
-                if self.running:
-                    return
-
-                self.running = True
-                self.pending = False
-
-            try:
-
-                now = time.time()
-
-                wait = (
-                    MIN_BACKUP_INTERVAL
-                    - (
-                        now
-                        - self.last_backup_time
-                    )
-                )
-
-                if wait > 0:
-                    time.sleep(
-                        wait
-                    )
-
-                backup_now(
-                    reason=reason
-                )
-
-                self.last_backup_time = (
-                    time.time()
-                )
-
-            except Exception:
-                log.exception(
-                    "Automatic backup failed."
-                )
-
-            finally:
-
-                with self.lock:
-                    self.running = False
-
-            with self.lock:
-
-                if not self.pending:
-                    break
-
-                self.pending = False
-
-                reason = "queued-change"
-
-    def stop(self):
-        with self.lock:
-            self.pending = False
-
-
-BACKUP_CONTROLLER = BackupController()
-
-
-# ============================================================
-# Backup
-# ============================================================
-
-BACKUP_MUTEX = threading.Lock()
-
-
-def backup_now(reason="manual"):
-    if not github_token():
-        raise RuntimeError(
-            "GITHUB_TOKEN is missing."
-        )
-
-    with BACKUP_MUTEX:
-
-        log.info(
-            "Starting persistent GitHub backup: %s",
-            reason,
-        )
-
-        snapshot, sha = (
-            create_snapshot()
-        )
-
-        try:
-            manifest = upload_snapshot(
-                snapshot,
-                sha,
-            )
-
-            return manifest
-
-        finally:
-
-            try:
-                snapshot.unlink()
-            except Exception:
-                pass
-
-
-# ============================================================
-# Filesystem watcher
-# ============================================================
-
-def start_filesystem_watcher():
-    """
-    Uses watchdog when available.
-
-    The watcher watches the Ubuntu rootfs and
-    schedules a GitHub snapshot after changes.
-    """
-
-    try:
-        from watchdog.observers import Observer
-        from watchdog.events import (
-            FileSystemEventHandler,
-        )
-
-    except Exception as e:
-        log.warning(
-            "watchdog unavailable: %s",
-            e,
-        )
-
-        return None
-
-    class Handler(
-        FileSystemEventHandler
-    ):
-
-        def _changed(self, event):
-
-            if event.is_directory:
-                return
-
-            path = str(
-                getattr(
-                    event,
-                    "src_path",
-                    "",
-                )
-            )
-
-            if not path:
-                return
-
-            # Ignore temporary/cache areas.
-            ignored = (
-                "/proc/",
-                "/sys/",
-                "/dev/",
-                "/run/",
-                "/tmp/",
-                "/var/cache/apt/",
-                "/var/lib/apt/lists/",
-            )
-
-            if any(
-                item in path
-                for item in ignored
-            ):
-                return
-
-            BACKUP_CONTROLLER.request(
-                reason="filesystem-change"
-            )
-
-        on_created = _changed
-        on_modified = _changed
-        on_moved = _changed
-        on_deleted = _changed
-
-    observer = Observer()
-
-    observer.schedule(
-        Handler(),
-        str(ROOTFS_DIR),
-        recursive=True,
-    )
-
-    observer.daemon = True
-    observer.start()
-
-    log.info(
-        "Filesystem watcher started."
-    )
-
-    return observer
+    return result.returncode == 0
 
 
 # ============================================================
@@ -1561,24 +1330,14 @@ def sshx_running():
 
     try:
         pid = int(
-            SSHX_PID_FILE.read_text().strip()
+            SSHX_PID_FILE.read_text(
+                encoding="utf-8"
+            ).strip()
         )
 
-        os.kill(
-            pid,
-            0,
-        )
+        os.kill(pid, 0)
 
         return True
-
-    except ProcessLookupError:
-
-        try:
-            SSHX_PID_FILE.unlink()
-        except Exception:
-            pass
-
-        return False
 
     except Exception:
         return False
@@ -1590,125 +1349,213 @@ def install_sshx():
         exist_ok=True,
     )
 
-    if SSHX_PATH.exists():
-        SSHX_PATH.chmod(
-            0o755
+    if (
+        SSHX_PATH.exists()
+        and os.access(
+            SSHX_PATH,
+            os.X_OK,
         )
+    ):
+        log(
+            f"SSHX already installed: "
+            f"{SSHX_PATH}"
+        )
+        return SSHX_PATH
 
-        return
-
-    log.info(
-        "Installing SSHX..."
+    archive = (
+        BASE_DIR /
+        "sshx.tar.gz"
     )
 
-    installer = (
+    extract_dir = (
         BASE_DIR /
-        "sshx-install.sh"
+        "sshx-extract"
+    )
+
+    archive.unlink(
+        missing_ok=True
+    )
+
+    if extract_dir.exists():
+        shutil.rmtree(
+            extract_dir,
+            ignore_errors=True,
+        )
+
+    extract_dir.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    log(
+        "Installing SSHX directly "
+        "without sudo..."
     )
 
     download_file(
-        SSHX_INSTALLER,
-        installer,
-    )
-
-    installer.chmod(
-        0o755
-    )
-
-    subprocess.run(
-        [
-            "bash",
-            str(installer),
-        ],
-        check=True,
+        SSHX_BINARY_URL,
+        archive,
         timeout=300,
     )
 
-    # sshx installer normally places the binary
-    # into ~/.local/bin.
-    if not SSHX_PATH.exists():
+    log(
+        "Extracting SSHX..."
+    )
 
-        candidates = [
-            Path.home()
-            / ".local"
-            / "bin"
-            / "sshx",
+    with tarfile.open(
+        archive,
+        "r:gz",
+    ) as tar:
 
-            Path("/usr/local/bin/sshx"),
-
-            Path("/usr/bin/sshx"),
-        ]
-
-        for candidate in candidates:
-
-            if candidate.exists():
-
-                if candidate != SSHX_PATH:
-
-                    shutil.copy2(
-                        candidate,
-                        SSHX_PATH,
-                    )
-
-                break
-
-    if not SSHX_PATH.exists():
-        raise RuntimeError(
-            "SSHX installation failed."
+        tar.extractall(
+            extract_dir
         )
+
+    candidates = []
+
+    for path in extract_dir.rglob("*"):
+
+        if (
+            path.is_file()
+            and path.name == "sshx"
+        ):
+            candidates.append(path)
+
+    if not candidates:
+        raise RuntimeError(
+            "SSHX binary was not found "
+            "after extraction."
+        )
+
+    source = candidates[0]
+
+    log(
+        f"SSHX binary found: {source}"
+    )
+
+    shutil.copy2(
+        source,
+        SSHX_PATH,
+    )
 
     SSHX_PATH.chmod(
         0o755
     )
 
+    archive.unlink(
+        missing_ok=True
+    )
 
-def start_sshx():
-    install_sshx()
+    shutil.rmtree(
+        extract_dir,
+        ignore_errors=True,
+    )
 
-    if sshx_running():
+    result = proot_command(
+        [
+            "/bin/bash",
+            "-lc",
+            (
+                "if [ -x "
+                "/root/.local/bin/sshx ]; then "
+                "/root/.local/bin/sshx --version "
+                "2>&1 || true; "
+                "fi"
+            ),
+        ],
+        check=False,
+        timeout=30,
+    )
 
-        log.info(
-            "SSHX already running: PID=%s",
-            SSHX_PID_FILE.read_text().strip(),
+    if result.stdout:
+        log(
+            "SSHX version: "
+            + result.stdout.strip()
         )
 
-        return
+    return SSHX_PATH
 
-    lock = (
-        STATE_DIR /
-        "sshx-start.lock"
+
+def extract_sshx_link():
+    if not SSHX_LOG_FILE.exists():
+        return None
+
+    try:
+        text = SSHX_LOG_FILE.read_text(
+            encoding="utf-8",
+            errors="ignore",
+        )
+    except Exception:
+        return None
+
+    patterns = [
+        r"https://sshx\.io/[A-Za-z0-9_\-/?=&.]+",
+        r"https://[A-Za-z0-9._-]+\.sshx\.io/[A-Za-z0-9_\-/?=&.]+",
+    ]
+
+    for pattern in patterns:
+        matches = re.findall(
+            pattern,
+            text,
+        )
+
+        if matches:
+            return matches[-1]
+
+    return None
+
+
+def start_sshx():
+    STATE_DIR.mkdir(
+        parents=True,
+        exist_ok=True,
     )
 
     try:
-        fd = os.open(
-            lock,
-            os.O_CREAT
-            | os.O_EXCL
-            | os.O_WRONLY,
+        lock = FileLock(
+            SSHX_LOCK_FILE,
+            blocking=False,
         )
 
-        os.close(fd)
+        lock.__enter__()
 
-    except FileExistsError:
-
-        log.info(
-            "Another SSHX startup is already running."
+    except BlockingIOError:
+        log(
+            "Another process is handling SSHX."
         )
-
         return
 
     try:
-
         if sshx_running():
+            log(
+                "SSHX is already running."
+            )
             return
+
+        install_sshx()
+
+        if not SSHX_PATH.exists():
+            raise RuntimeError(
+                "SSHX binary does not exist."
+            )
+
+        SSHX_LOG_FILE.parent.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
 
         log_file = open(
             SSHX_LOG_FILE,
             "a",
             buffering=1,
+            encoding="utf-8",
         )
 
-        proc = subprocess.Popen(
+        log_file.write(
+            "\n\n===== SSHX START =====\n"
+        )
+
+        process = subprocess.Popen(
             [
                 str(SSHX_PATH),
                 "run",
@@ -1716,526 +1563,688 @@ def start_sshx():
             stdin=subprocess.DEVNULL,
             stdout=log_file,
             stderr=subprocess.STDOUT,
+            cwd=str(
+                ROOTFS_DIR / "root"
+            ),
             start_new_session=True,
         )
 
         SSHX_PID_FILE.write_text(
-            str(proc.pid),
+            str(process.pid),
             encoding="utf-8",
         )
 
-        log.info(
-            "SSHX started. PID=%s",
-            proc.pid,
+        log(
+            f"SSHX started. PID={process.pid}"
         )
 
-        def detect_link():
+        time.sleep(3)
 
-            for _ in range(60):
+        if process.poll() is not None:
+            log(
+                "SSHX exited immediately. "
+                f"returncode={process.returncode}"
+            )
 
-                time.sleep(1)
+        link = extract_sshx_link()
 
-                try:
-
-                    text = (
-                        SSHX_LOG_FILE.read_text(
-                            errors="ignore"
-                        )
-                    )
-
-                    for line in text.splitlines():
-
-                        match = re.search(
-                            r"https://[^\s]+",
-                            line,
-                        )
-
-                        if not match:
-                            continue
-
-                        link = match.group(
-                            0
-                        ).rstrip(
-                            ".,)"
-                        )
-
-                        SSHX_LINK_FILE.write_text(
-                            link,
-                            encoding="utf-8",
-                        )
-
-                        log.info(
-                            "SSHX link detected: %s",
-                            link,
-                        )
-
-                        return
-
-                except Exception:
-                    pass
-
-        threading.Thread(
-            target=detect_link,
-            daemon=True,
-        ).start()
+        if link:
+            log(
+                f"SSHX link: {link}"
+            )
 
     finally:
-
         try:
-            lock.unlink()
+            lock.__exit__(
+                None,
+                None,
+                None,
+            )
         except Exception:
             pass
 
 
 # ============================================================
-# Persistent service definitions
+# PERSISTENT SERVICE DEFINITIONS
 # ============================================================
 
-def service_definitions():
+def ensure_service_dir():
     SERVICE_DIR.mkdir(
         parents=True,
         exist_ok=True,
     )
 
-    result = []
 
-    for file in SERVICE_DIR.glob(
-        "*.json"
-    ):
-
-        data = load_json(
-            file
-        )
-
-        if isinstance(
-            data,
-            dict,
-        ):
-            result.append(
-                data
-            )
-
-    return result
-
-
-def create_shlctl():
-    path = (
-        ROOTFS_DIR /
-        "usr/local/bin/shlctl"
+def service_pid_file(name):
+    return (
+        STATE_DIR /
+        f"service-{name}.pid"
     )
 
-    path.parent.mkdir(
+
+def service_is_running(name):
+    path = service_pid_file(name)
+
+    if not path.exists():
+        return False
+
+    try:
+        pid = int(
+            path.read_text(
+                encoding="utf-8"
+            ).strip()
+        )
+
+        os.kill(pid, 0)
+
+        return True
+
+    except Exception:
+        return False
+
+
+def load_services():
+    ensure_service_dir()
+
+    services = []
+
+    for path in sorted(
+        SERVICE_DIR.glob("*.json")
+    ):
+
+        try:
+            data = json.loads(
+                path.read_text(
+                    encoding="utf-8"
+                )
+            )
+
+            if data.get(
+                "enabled",
+                True,
+            ):
+                services.append(data)
+
+        except Exception as exc:
+            log(
+                f"Invalid service file "
+                f"{path}: {exc}"
+            )
+
+    return services
+
+
+def start_service(service):
+    name = service["name"]
+    command = service["command"]
+
+    if service_is_running(name):
+        log(
+            f"Service already running: "
+            f"{name}"
+        )
+        return
+
+    log(
+        f"Starting persistent service: "
+        f"{name}"
+    )
+
+    service_log = (
+        STATE_DIR /
+        f"service-{name}.log"
+    )
+
+    service_log.parent.mkdir(
         parents=True,
         exist_ok=True,
     )
 
-    script = r'''#!/bin/bash
-
-set -e
-
-SERVICE_DIR="/etc/shl/services"
-RUN_DIR="/run/shl"
-
-mkdir -p "$SERVICE_DIR"
-mkdir -p "$RUN_DIR"
-
-usage() {
-    echo "shlctl list"
-    echo "shlctl start NAME"
-    echo "shlctl stop NAME"
-    echo "shlctl restart NAME"
-    echo "shlctl status NAME"
-}
-
-get_cmd() {
-    local name="$1"
-    local file="$SERVICE_DIR/$name.json"
-
-    if [ ! -f "$file" ]; then
-        echo "Service not found: $name"
-        exit 1
-    fi
-
-    python3 - "$file" <<'PY'
-import json
-import sys
-
-with open(sys.argv[1]) as f:
-    data=json.load(f)
-
-print(data.get("command",""))
-PY
-}
-
-case "${1:-}" in
-
-    list)
-        find "$SERVICE_DIR" -maxdepth 1 \
-            -type f -name '*.json' \
-            -printf '%f\n' |
-            sed 's/\.json$//'
-        ;;
-
-    start)
-        NAME="${2:-}"
-
-        if [ -z "$NAME" ]; then
-            usage
-            exit 1
-        fi
-
-        CMD="$(get_cmd "$NAME")"
-
-        if [ -z "$CMD" ]; then
-            echo "No command"
-            exit 1
-        fi
-
-        mkdir -p "$RUN_DIR"
-
-        nohup bash -lc "$CMD" \
-            >"$RUN_DIR/$NAME.log" 2>&1 &
-
-        echo $! >"$RUN_DIR/$NAME.pid"
-
-        echo "Started $NAME"
-        ;;
-
-    stop)
-        NAME="${2:-}"
-        PID="$RUN_DIR/$NAME.pid"
-
-        if [ -f "$PID" ]; then
-            kill "$(cat "$PID")" 2>/dev/null || true
-            rm -f "$PID"
-        fi
-
-        echo "Stopped $NAME"
-        ;;
-
-    restart)
-        "$0" stop "$2" || true
-        sleep 1
-        "$0" start "$2"
-        ;;
-
-    status)
-        NAME="${2:-}"
-        PID="$RUN_DIR/$NAME.pid"
-
-        if [ -f "$PID" ] &&
-           kill -0 "$(cat "$PID")" 2>/dev/null
-        then
-            echo "$NAME: running PID=$(cat "$PID")"
-        else
-            echo "$NAME: stopped"
-        fi
-        ;;
-
-    *)
-        usage
-        exit 1
-        ;;
-esac
-'''
-
-    path.write_text(
-        script,
+    lf = open(
+        service_log,
+        "a",
+        buffering=1,
         encoding="utf-8",
     )
 
-    path.chmod(
-        0o755
+    process = subprocess.Popen(
+        [
+            str(PROOT_DIR / "proot"),
+            "-0",
+            "-r",
+            str(ROOTFS_DIR),
+
+            "-b",
+            "/dev",
+
+            "-b",
+            "/dev/pts",
+
+            "-b",
+            "/proc",
+
+            "-b",
+            "/sys",
+
+            "-b",
+            "/etc/resolv.conf:"
+            "/etc/resolv.conf",
+
+            "-w",
+            "/root",
+
+            "/bin/bash",
+            "-lc",
+            command,
+        ],
+        stdin=subprocess.DEVNULL,
+        stdout=lf,
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
+    )
+
+    service_pid_file(
+        name
+    ).write_text(
+        str(process.pid),
+        encoding="utf-8",
+    )
+
+    log(
+        f"Service {name} started "
+        f"PID={process.pid}"
     )
 
 
 def start_persistent_services():
-    create_shlctl()
+    for service in load_services():
+        try:
+            start_service(
+                service
+            )
+        except Exception as exc:
+            log(
+                f"Service {service.get('name')} "
+                f"failed: {exc}"
+            )
 
-    services = service_definitions()
 
-    for service in services:
+# ============================================================
+# WATCHER
+# ============================================================
 
-        if not service.get(
-            "enabled",
-            True,
-        ):
-            continue
+WATCHER_STARTED_FILE = (
+    STATE_DIR /
+    "watcher.started"
+)
 
-        name = service.get(
-            "name"
+watcher_thread = None
+watcher_stop = threading.Event()
+
+
+def should_ignore_watch_path(path):
+    try:
+        relative = Path(path).relative_to(
+            ROOTFS_DIR
         )
+    except Exception:
+        return True
 
-        command = service.get(
-            "command"
-        )
+    parts = relative.parts
 
-        if not name or not command:
-            continue
+    if not parts:
+        return True
 
-        log.info(
-            "Starting persistent service: %s",
-            name,
-        )
+    if parts[0] in VOLATILE_TOP_LEVEL:
+        return True
+
+    if (
+        parts[0] == "var"
+        and len(parts) >= 2
+        and parts[1] == "cache"
+    ):
+        return True
+
+    if (
+        parts[0] == "var"
+        and len(parts) >= 3
+        and parts[1] == "lib"
+        and parts[2] == "apt"
+    ):
+        return True
+
+    return False
+
+
+def watcher_loop():
+    """
+    Lightweight periodic dirty-state watcher.
+
+    It intentionally DOES NOT create a snapshot on every
+    filesystem event.
+
+    A full Ubuntu snapshot can be hundreds of MB.
+    """
+
+    last_mtime = 0
+
+    while not watcher_stop.is_set():
 
         try:
 
-            run_dir = (
-                ROOTFS_DIR /
-                "run/shl"
+            newest = 0
+
+            for root, dirs, files in os.walk(
+                ROOTFS_DIR
+            ):
+
+                dirs[:] = [
+                    d for d in dirs
+                    if d not in VOLATILE_TOP_LEVEL
+                ]
+
+                for name in files[:]:
+                    try:
+                        path = (
+                            Path(root) /
+                            name
+                        )
+
+                        if should_ignore_watch_path(
+                            path
+                        ):
+                            continue
+
+                        mtime = path.stat().st_mtime_ns
+
+                        if mtime > newest:
+                            newest = mtime
+
+                    except Exception:
+                        pass
+
+            if newest > last_mtime:
+                last_mtime = newest
+
+                state = {
+                    "dirty": True,
+                    "detected_at": datetime.now(
+                        timezone.utc
+                    ).isoformat(),
+                }
+
+                WATCHER_STATE_FILE.write_text(
+                    json.dumps(
+                        state,
+                        indent=2,
+                    ),
+                    encoding="utf-8",
+                )
+
+        except Exception as exc:
+            log(
+                f"Watcher error: {exc}"
             )
 
-            run_dir.mkdir(
-                parents=True,
-                exist_ok=True,
+        watcher_stop.wait(
+            60
+        )
+
+
+def start_watcher():
+    global watcher_thread
+
+    if watcher_thread is not None:
+        return
+
+    watcher_thread = threading.Thread(
+        target=watcher_loop,
+        daemon=True,
+        name="shl-watcher",
+    )
+
+    watcher_thread.start()
+
+    log(
+        "Filesystem watcher started."
+    )
+
+
+# ============================================================
+# AUTO BACKUP CHECK
+# ============================================================
+
+def maybe_auto_backup():
+    if not GITHUB_TOKEN:
+        return
+
+    if not WATCHER_STATE_FILE.exists():
+        return
+
+    try:
+        watcher_state = json.loads(
+            WATCHER_STATE_FILE.read_text(
+                encoding="utf-8"
+            )
+        )
+    except Exception:
+        return
+
+    if not watcher_state.get(
+        "dirty",
+        False,
+    ):
+        return
+
+    last_backup = 0
+
+    if BACKUP_STATE_FILE.exists():
+
+        try:
+            state = json.loads(
+                BACKUP_STATE_FILE.read_text(
+                    encoding="utf-8"
+                )
             )
 
-            pid_file = (
-                run_dir /
-                f"{name}.pid"
+            finished = state.get(
+                "finished_at"
             )
 
-            if pid_file.exists():
+            if finished:
+                dt = datetime.fromisoformat(
+                    finished
+                )
 
-                try:
-
-                    pid = int(
-                        pid_file.read_text()
-                    )
-
-                    os.kill(
-                        pid,
-                        0,
-                    )
-
-                    continue
-
-                except Exception:
-                    pass
-
-            log_file = (
-                run_dir /
-                f"{name}.log"
-            )
-
-            command_line = (
-                "nohup bash -lc "
-                + repr(command)
-                + " >"
-                + repr(str(log_file))
-                + " 2>&1 & echo $! >"
-                + repr(str(pid_file))
-            )
-
-            run_ubuntu(
-                command_line,
-                check=False,
-                timeout=60,
-            )
+                last_backup = dt.timestamp()
 
         except Exception:
-            log.exception(
-                "Could not start service %s",
-                name,
-            )
+            pass
+
+    now = time.time()
+
+    if (
+        now - last_backup
+        < AUTO_BACKUP_INTERVAL
+    ):
+        return
+
+    backup_now(
+        "automatic"
+    )
+
+    try:
+        watcher_state["dirty"] = False
+
+        WATCHER_STATE_FILE.write_text(
+            json.dumps(
+                watcher_state,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+    except Exception:
+        pass
 
 
 # ============================================================
-# Persistent bootstrap
+# BOOTSTRAP
 # ============================================================
 
-_BOOTSTRAPPED = False
-_WATCHER = None
+BOOTSTRAP_DONE_FILE = (
+    STATE_DIR /
+    "bootstrap.done"
+)
 
 
 def bootstrap():
-    global _BOOTSTRAPPED
-    global _WATCHER
-
-    if _BOOTSTRAPPED:
-        return
-
     ensure_dirs()
 
-    log.info(
-        "========================================"
-    )
-
-    log.info(
-        "SHL persistent Ubuntu bootstrap"
-    )
-
-    log.info(
-        "========================================"
-    )
-
-    token = github_token()
-
-    restored = False
-
-    if token:
-
-        try:
-            restored = restore_snapshot()
-
-        except Exception:
-            log.exception(
-                "Persistent restore failed."
-            )
-
-    else:
-
-        log.warning(
-            "GITHUB_TOKEN is missing."
+    try:
+        lock = FileLock(
+            BOOTSTRAP_LOCK_FILE,
+            blocking=True,
         )
 
-    if not restored:
+        lock.__enter__()
 
-        extract_ubuntu()
+    except Exception as exc:
+        log(
+            f"Bootstrap lock failed: {exc}"
+        )
+        raise
+
+    try:
+
+        log(
+            f"{APP_NAME} {APP_VERSION} bootstrap..."
+        )
+
+        # ----------------------------------------------------
+        # PERSISTENT RESTORE
+        # ----------------------------------------------------
+
+        restored = False
+
+        if GITHUB_TOKEN:
+
+            try:
+
+                if github_branch_exists(
+                    PERSISTENT_BRANCH
+                ):
+
+                    manifest = load_manifest()
+
+                    if manifest:
+                        log(
+                            "Persistent manifest found."
+                        )
+
+                        # Restore only if local Ubuntu
+                        # is missing.
+                        if not ROOTFS_DIR.exists():
+                            restore_snapshot(
+                                manifest
+                            )
+                            restored = True
+
+                    else:
+                        log(
+                            "No persistent manifest yet."
+                        )
+
+                else:
+                    log(
+                        "No persistent state branch yet."
+                    )
+
+            except Exception as exc:
+                log(
+                    f"Persistent restore check "
+                    f"failed: {exc}"
+                )
+
+        # ----------------------------------------------------
+        # BASE UBUNTU
+        # ----------------------------------------------------
+
+        if not ROOTFS_DIR.exists():
+            extract_ubuntu_base()
+
         configure_ubuntu()
+
+        # ----------------------------------------------------
+        # PROOT
+        # ----------------------------------------------------
+
+        install_proot()
+
+        # ----------------------------------------------------
+        # PACKAGE INSTALL
+        # ----------------------------------------------------
+
         install_base_packages()
 
-    else:
+        # ----------------------------------------------------
+        # TEST UBUNTU
+        # ----------------------------------------------------
 
-        log.info(
-            "Persistent Ubuntu restored; "
-            "skipping base package installation."
-        )
+        if not test_ubuntu():
+            raise RuntimeError(
+                "Ubuntu environment test failed."
+            )
 
-    create_shlctl()
+        # ----------------------------------------------------
+        # SSHX
+        # ----------------------------------------------------
 
-    try:
-        ubuntu_test()
-    except Exception:
-        log.exception(
-            "Ubuntu test failed."
-        )
+        try:
+            start_sshx()
+        except Exception:
+            logger.exception(
+                "SSHX startup failed."
+            )
 
-    try:
-        start_sshx()
-    except Exception:
-        log.exception(
-            "SSHX startup failed."
-        )
+        # ----------------------------------------------------
+        # SERVICES
+        # ----------------------------------------------------
 
-    try:
         start_persistent_services()
-    except Exception:
-        log.exception(
-            "Persistent service startup failed."
-        )
 
-    if token:
+        # ----------------------------------------------------
+        # WATCHER
+        # ----------------------------------------------------
 
-        try:
-            # If there is no persistent state yet,
-            # create the first snapshot.
-            if not github_branch_exists(
-                PERSISTENT_BRANCH
-            ):
+        start_watcher()
 
-                log.info(
-                    "No persistent state branch yet."
-                )
+        # ----------------------------------------------------
+        # INITIAL BACKUP
+        # ----------------------------------------------------
 
+        if (
+            GITHUB_TOKEN
+            and not manifest_exists()
+        ):
+            try:
                 backup_now(
-                    reason="initial"
+                    "initial"
+                )
+            except Exception:
+                logger.exception(
+                    "Initial persistent "
+                    "backup failed."
                 )
 
-        except Exception:
-            log.exception(
-                "Initial persistent backup failed."
-            )
-
-        try:
-
-            _WATCHER = (
-                start_filesystem_watcher()
-            )
-
-        except Exception:
-            log.exception(
-                "Filesystem watcher failed."
-            )
-
-    else:
-
-        log.warning(
-            "GitHub persistence is disabled "
-            "because GITHUB_TOKEN is missing."
+        BOOTSTRAP_DONE_FILE.write_text(
+            datetime.now(
+                timezone.utc
+            ).isoformat(),
+            encoding="utf-8",
         )
 
-    _BOOTSTRAPPED = True
+        log(
+            "SHL Ubuntu environment is ready."
+        )
 
-    log.info(
-        "SHL Ubuntu environment is ready."
-    )
+    finally:
+
+        try:
+            lock.__exit__(
+                None,
+                None,
+                None,
+            )
+        except Exception:
+            pass
 
 
-# ============================================================
-# Shutdown
-# ============================================================
-
-_SHUTDOWN_DONE = False
-
-
-def shutdown_handler(
-    signum=None,
-    frame=None,
-):
-    global _SHUTDOWN_DONE
-
-    if _SHUTDOWN_DONE:
-        return
-
-    _SHUTDOWN_DONE = True
-
-    log.info(
-        "Shutdown detected. "
-        "Creating final persistent backup..."
-    )
+def manifest_exists():
+    if not GITHUB_TOKEN:
+        return False
 
     try:
-
-        if github_token():
-
-            backup_now(
-                reason="shutdown"
-            )
-
-        else:
-
-            log.warning(
-                "Final backup skipped: "
-                "GITHUB_TOKEN missing."
-            )
-
+        return load_manifest() is not None
     except Exception:
-        log.exception(
-            "Final persistent backup failed."
-        )
-
-    if signum is not None:
-        raise SystemExit(0)
-
-
-try:
-    signal.signal(
-        signal.SIGTERM,
-        shutdown_handler,
-    )
-
-    signal.signal(
-        signal.SIGINT,
-        shutdown_handler,
-    )
-
-except Exception:
-    pass
+        return False
 
 
 # ============================================================
-# Streamlit UI
+# STREAMLIT SESSION
+# ============================================================
+
+@st.cache_resource(
+    show_spinner=False
+)
+def initialize_runtime():
+    bootstrap()
+
+    return {
+        "ready": True,
+        "time": datetime.now(
+            timezone.utc
+        ).isoformat(),
+    }
+
+
+# ============================================================
+# UI HELPERS
+# ============================================================
+
+def get_backup_state():
+    if not BACKUP_STATE_FILE.exists():
+        return {}
+
+    try:
+        return json.loads(
+            BACKUP_STATE_FILE.read_text(
+                encoding="utf-8"
+            )
+        )
+    except Exception:
+        return {}
+
+
+def get_sshx_link():
+    return extract_sshx_link()
+
+
+def get_sshx_pid():
+    if not SSHX_PID_FILE.exists():
+        return None
+
+    try:
+        return int(
+            SSHX_PID_FILE.read_text(
+                encoding="utf-8"
+            ).strip()
+        )
+    except Exception:
+        return None
+
+
+def ubuntu_command_ui(command):
+    try:
+        result = proot_command(
+            [
+                "/bin/bash",
+                "-lc",
+                command,
+            ],
+            check=False,
+            timeout=300,
+        )
+
+        return result.stdout or ""
+
+    except Exception as exc:
+        return (
+            f"ERROR: {exc}"
+        )
+
+
+# ============================================================
+# STREAMLIT UI
 # ============================================================
 
 st.set_page_config(
@@ -2245,33 +2254,46 @@ st.set_page_config(
 )
 
 
-# Bootstrap before UI.
-try:
-    bootstrap()
-
-except Exception as e:
-
-    log.exception(
-        "Bootstrap failed."
-    )
-
-    st.error(
-        f"SHL bootstrap failed: {e}"
-    )
-
-
 st.title(
-    "🖥️ SHL Persistent Ubuntu Server"
+    "🖥️ SHL Persistent Ubuntu"
 )
 
 st.caption(
-    f"GitHub persistence: "
-    f"{GITHUB_REPO} → {PERSISTENT_BRANCH}"
+    f"Version {APP_VERSION} • "
+    f"Ubuntu 22.04.5 • "
+    f"PRoot • GitHub persistence"
 )
 
 
 # ============================================================
-# Status
+# INITIALIZATION
+# ============================================================
+
+try:
+    initialize_runtime()
+
+except Exception as exc:
+
+    st.error(
+        "SHL bootstrap failed."
+    )
+
+    st.exception(exc)
+
+    st.stop()
+
+
+# Automatic backup check.
+try:
+    maybe_auto_backup()
+except Exception as exc:
+    log(
+        f"Automatic backup check failed: {exc}"
+    )
+
+
+# ============================================================
+# STATUS
 # ============================================================
 
 col1, col2, col3, col4 = st.columns(4)
@@ -2279,7 +2301,7 @@ col1, col2, col3, col4 = st.columns(4)
 
 with col1:
 
-    if rootfs_exists():
+    if ROOTFS_DIR.exists():
         st.success(
             "Ubuntu: READY"
         )
@@ -2291,18 +2313,6 @@ with col1:
 
 with col2:
 
-    if github_token():
-        st.success(
-            "GitHub: CONNECTED"
-        )
-    else:
-        st.error(
-            "GitHub: TOKEN MISSING"
-        )
-
-
-with col3:
-
     if sshx_running():
         st.success(
             "SSHX: RUNNING"
@@ -2313,155 +2323,136 @@ with col3:
         )
 
 
+with col3:
+
+    if GITHUB_TOKEN:
+        if github_branch_exists(
+            PERSISTENT_BRANCH
+        ):
+            st.success(
+                "GitHub: CONNECTED"
+            )
+        else:
+            st.info(
+                "GitHub: READY"
+            )
+    else:
+        st.error(
+            "GitHub: TOKEN MISSING"
+        )
+
+
 with col4:
 
-    if github_branch_exists(
-        PERSISTENT_BRANCH
-    ):
-        st.success(
-            "Backup: ENABLED"
-        )
-    else:
-        st.warning(
-            "Backup: NOT CREATED"
-        )
+    backup_state = get_backup_state()
 
-
-# ============================================================
-# Manual backup
-# ============================================================
-
-st.divider()
-
-st.subheader(
-    "💾 Persistent Backup"
-)
-
-c1, c2 = st.columns(2)
-
-
-with c1:
-
-    if st.button(
-        "💾 Backup Now",
-        use_container_width=True,
-    ):
-
-        with st.spinner(
-            "Creating GitHub snapshot..."
-        ):
-
-            try:
-
-                manifest = backup_now(
-                    reason="manual"
-                )
-
-                st.success(
-                    "Backup completed successfully."
-                )
-
-                st.json(
-                    {
-                        "branch": PERSISTENT_BRANCH,
-                        "sha256": manifest.get(
-                            "snapshot_sha256"
-                        ),
-                        "size_mb": round(
-                            manifest.get(
-                                "snapshot_size",
-                                0,
-                            )
-                            / 1024
-                            / 1024,
-                            2,
-                        ),
-                        "chunks": len(
-                            manifest.get(
-                                "chunks",
-                                [],
-                            )
-                        ),
-                    }
-                )
-
-            except Exception as e:
-
-                st.error(
-                    f"Backup failed: {e}"
-                )
-
-
-with c2:
-
-    state = load_json(
-        BACKUP_STATE_FILE,
-        {},
+    status = backup_state.get(
+        "status"
     )
 
-    if state:
-
-        st.write(
-            "Last backup:"
+    if status == "success":
+        st.success(
+            "Backup: OK"
         )
-
-        st.code(
-            state.get(
-                "last_backup",
-                "unknown",
-            )
-        )
-
-        st.write(
-            f"Chunks: "
-            f"{state.get('chunks', '?')}"
-        )
-
-    else:
-
+    elif status == "running":
         st.info(
-            "No local backup state yet."
+            "Backup: RUNNING"
         )
+    elif status == "failed":
+        st.error(
+            "Backup: FAILED"
+        )
+    else:
+        st.info(
+            "Backup: NOT YET"
+        )
+
+
+st.divider()
 
 
 # ============================================================
 # SSHX
 # ============================================================
 
-st.divider()
-
 st.subheader(
-    "🔐 SSHX"
+    "🔗 SSHX"
 )
 
-if sshx_running():
+sshx_col1, sshx_col2 = st.columns(
+    [3, 1]
+)
 
-    pid = SSHX_PID_FILE.read_text(
-        encoding="utf-8"
-    ).strip()
+with sshx_col1:
 
-    st.success(
-        f"SSHX running — PID {pid}"
-    )
-
-else:
-
-    st.warning(
-        "SSHX is not running."
-    )
-
-if SSHX_LINK_FILE.exists():
-
-    link = SSHX_LINK_FILE.read_text(
-        encoding="utf-8"
-    ).strip()
+    link = get_sshx_link()
 
     if link:
+        st.success(
+            "SSHX link detected:"
+        )
+
+        st.code(
+            link,
+            language="text",
+        )
 
         st.markdown(
-            f"### SSHX Link\n"
-            f"`{link}`"
+            f"[Open SSHX]({link})"
         )
+
+    else:
+        st.info(
+            "SSHX link has not appeared yet."
+        )
+
+with sshx_col2:
+
+    st.write(
+        f"PID: {get_sshx_pid()}"
+    )
+
+    if st.button(
+        "Restart SSHX",
+        use_container_width=True,
+    ):
+
+        try:
+
+            if SSHX_PID_FILE.exists():
+
+                try:
+                    pid = int(
+                        SSHX_PID_FILE.read_text(
+                            encoding="utf-8"
+                        ).strip()
+                    )
+
+                    os.kill(
+                        pid,
+                        signal.SIGTERM,
+                    )
+
+                except Exception:
+                    pass
+
+                SSHX_PID_FILE.unlink(
+                    missing_ok=True
+                )
+
+            start_sshx()
+
+            st.success(
+                "SSHX restart requested."
+            )
+
+            st.rerun()
+
+        except Exception as exc:
+
+            st.error(
+                f"SSHX restart failed: {exc}"
+            )
 
 
 with st.expander(
@@ -2471,114 +2462,251 @@ with st.expander(
     if SSHX_LOG_FILE.exists():
 
         text = SSHX_LOG_FILE.read_text(
-            errors="replace"
+            encoding="utf-8",
+            errors="ignore",
         )
 
         st.code(
-            text[-12000:]
+            text[-15000:],
+            language="text",
         )
 
     else:
 
         st.info(
-            "No SSHX log."
+            "No SSHX log yet."
         )
 
 
 # ============================================================
-# Ubuntu terminal
+# BACKUP
 # ============================================================
 
 st.divider()
 
 st.subheader(
-    "🐧 Ubuntu"
+    "💾 Persistent GitHub Backup"
 )
+
+backup_col1, backup_col2 = st.columns(
+    [2, 1]
+)
+
+with backup_col1:
+
+    st.write(
+        f"Repository: `{GITHUB_REPO}`"
+    )
+
+    st.write(
+        f"State branch: `{PERSISTENT_BRANCH}`"
+    )
+
+    state = get_backup_state()
+
+    if state:
+        st.json(state)
+
+with backup_col2:
+
+    if st.button(
+        "💾 Backup Now",
+        type="primary",
+        use_container_width=True,
+    ):
+
+        with st.spinner(
+            "Creating and uploading Ubuntu snapshot..."
+        ):
+
+            ok = backup_now(
+                "manual"
+            )
+
+        if ok:
+            st.success(
+                "Backup completed."
+            )
+        else:
+            st.error(
+                "Backup failed. Check logs."
+            )
+
+        st.rerun()
+
+
+# ============================================================
+# PERSISTENT MANIFEST
+# ============================================================
+
+st.subheader(
+    "📦 Persistent Snapshot"
+)
+
+try:
+
+    manifest = load_manifest()
+
+    if manifest:
+
+        m1, m2, m3 = st.columns(3)
+
+        with m1:
+            st.metric(
+                "Snapshot",
+                manifest.get(
+                    "snapshot_id",
+                    "-",
+                ),
+            )
+
+        with m2:
+            size = manifest.get(
+                "archive_size",
+                0,
+            )
+
+            st.metric(
+                "Size",
+                f"{size / 1024 / 1024:.1f} MB",
+            )
+
+        with m3:
+            st.metric(
+                "Parts",
+                len(
+                    manifest.get(
+                        "parts",
+                        [],
+                    )
+                ),
+            )
+
+        st.write(
+            "SHA256:"
+        )
+
+        st.code(
+            manifest.get(
+                "archive_sha256",
+                "-",
+            ),
+            language="text",
+        )
+
+    else:
+
+        st.info(
+            "No persistent snapshot found."
+        )
+
+except Exception as exc:
+
+    st.warning(
+        f"Manifest unavailable: {exc}"
+    )
+
+
+# ============================================================
+# UBUNTU TERMINAL
+# ============================================================
+
+st.divider()
+
+st.subheader(
+    "⌨️ Ubuntu Terminal"
+)
+
+if "terminal_output" not in st.session_state:
+    st.session_state.terminal_output = ""
 
 command = st.text_input(
-    "Ubuntu command",
+    "Command",
     value="neofetch",
+    key="ubuntu_command",
 )
 
+run_col1, run_col2 = st.columns(
+    [1, 5]
+)
 
-if st.button(
-    "▶ Run command",
-    use_container_width=True,
-):
+with run_col1:
 
-    try:
+    run_clicked = st.button(
+        "Run",
+        type="primary",
+        use_container_width=True,
+    )
 
-        result = run_ubuntu(
-            command,
-            check=False,
-            timeout=300,
+if run_clicked:
+
+    with st.spinner(
+        "Running..."
+    ):
+
+        output = ubuntu_command_ui(
+            command
         )
 
-        output = ""
+    st.session_state.terminal_output = output
 
-        if result.stdout:
-            output += result.stdout
 
-        if result.stderr:
-            output += "\n" + result.stderr
+if st.session_state.terminal_output:
 
-        st.code(
-            output
-        )
-
-        # Command may have changed the filesystem.
-        BACKUP_CONTROLLER.request(
-            reason="terminal-command"
-        )
-
-    except Exception as e:
-
-        st.error(
-            f"Command failed: {e}"
-        )
+    st.code(
+        st.session_state.terminal_output,
+        language="text",
+    )
 
 
 # ============================================================
-# Package status
+# COMMON COMMANDS
 # ============================================================
-
-st.divider()
 
 st.subheader(
-    "📦 Package Test"
+    "⚡ Quick Commands"
 )
 
-if st.button(
-    "Check installed packages",
+quick_commands = [
+    "neofetch",
+    "uname -a",
+    "df -h",
+    "free -h",
+    "ip addr",
+    "ps aux",
+    "python3 --version",
+    "git --version",
+    "curl --version",
+]
+
+quick_cols = st.columns(3)
+
+for index, command in enumerate(
+    quick_commands
 ):
 
-    try:
+    with quick_cols[
+        index % 3
+    ]:
 
-        result = run_ubuntu(
-            "command -v neofetch; "
-            "command -v python3; "
-            "command -v git; "
-            "command -v curl; "
-            "python3 --version",
-            check=False,
-            timeout=60,
-        )
+        if st.button(
+            command,
+            key=f"quick_{index}",
+            use_container_width=True,
+        ):
 
-        st.code(
-            result.stdout
-            + "\n"
-            + result.stderr
-        )
+            output = ubuntu_command_ui(
+                command
+            )
 
-    except Exception as e:
-
-        st.error(
-            str(e)
-        )
+            st.code(
+                output,
+                language="text",
+            )
 
 
 # ============================================================
-# Persistent services
+# SERVICES
 # ============================================================
 
 st.divider()
@@ -2587,7 +2715,7 @@ st.subheader(
     "⚙️ Persistent Services"
 )
 
-services = service_definitions()
+services = load_services()
 
 if not services:
 
@@ -2604,164 +2732,109 @@ else:
             "unknown",
         )
 
-        command = service.get(
-            "command",
-            "",
-        )
-
-        enabled = service.get(
-            "enabled",
-            True,
-        )
-
-        with st.expander(
+        running = service_is_running(
             name
-        ):
+        )
 
-            st.write(
-                f"Enabled: {enabled}"
+        if running:
+            st.success(
+                f"{name}: RUNNING"
+            )
+        else:
+            st.warning(
+                f"{name}: STOPPED"
             )
 
-            st.code(
-                command
-            )
+        st.code(
+            service.get(
+                "command",
+                "",
+            ),
+            language="bash",
+        )
 
 
 # ============================================================
-# GitHub persistence information
+# FILESYSTEM STATUS
 # ============================================================
 
 st.divider()
 
 st.subheader(
-    "🐙 GitHub Persistence"
+    "📁 Runtime Status"
 )
 
-st.write(
-    f"Repository: `{GITHUB_REPO}`"
+runtime_col1, runtime_col2 = st.columns(
+    2
 )
 
-st.write(
-    f"Application branch: `{GITHUB_BRANCH}`"
-)
+with runtime_col1:
 
-st.write(
-    f"Persistent branch: `{PERSISTENT_BRANCH}`"
-)
-
-manifest = github_get_file(
-    ".shl/manifest.json"
-)
-
-if manifest:
-
-    try:
-
-        data = base64.b64decode(
-            manifest["content"]
-            .replace("\n", "")
-        )
-
-        parsed = json.loads(
-            data.decode("utf-8")
-        )
-
-        st.json(
-            {
-                "created_at": parsed.get(
-                    "created_at"
-                ),
-                "snapshot_size_mb": round(
-                    parsed.get(
-                        "snapshot_size",
-                        0,
-                    )
-                    / 1024
-                    / 1024,
-                    2,
-                ),
-                "chunks": len(
-                    parsed.get(
-                        "chunks",
-                        [],
-                    )
-                ),
-                "sha256": parsed.get(
-                    "snapshot_sha256"
-                ),
-            }
-        )
-
-    except Exception as e:
-
-        st.warning(
-            f"Could not read manifest: {e}"
-        )
-
-else:
-
-    st.warning(
-        "No persistent GitHub snapshot exists yet."
+    st.write(
+        f"Runtime: `{BASE_DIR}`"
     )
+
+    st.write(
+        f"Ubuntu: `{ROOTFS_DIR}`"
+    )
+
+    st.write(
+        f"PRoot: `{PROOT_DIR}`"
+    )
+
+with runtime_col2:
+
+    if BOOTSTRAP_DONE_FILE.exists():
+
+        st.write(
+            "Bootstrap:"
+        )
+
+        st.code(
+            BOOTSTRAP_DONE_FILE.read_text(
+                encoding="utf-8"
+            ).strip(),
+            language="text",
+        )
+
+    else:
+
+        st.write(
+            "Bootstrap: unknown"
+        )
 
 
 # ============================================================
-# Architecture / environment
-# ============================================================
-
-st.divider()
-
-st.subheader(
-    "🖥️ Environment"
-)
-
-try:
-
-    architecture = (
-        os.uname().machine
-    )
-
-except Exception:
-
-    architecture = "unknown"
-
-
-st.code(
-    "\n".join(
-        [
-            f"Architecture: {architecture}",
-            f"Ubuntu rootfs: {ROOTFS_DIR}",
-            f"PRoot: {PROOT_DIR / 'proot'}",
-            f"GitHub repo: {GITHUB_REPO}",
-            f"Persistent branch: {PERSISTENT_BRANCH}",
-        ]
-    )
-)
-
-
-# ============================================================
-# Important information
+# IMPORTANT PERSISTENCE NOTE
 # ============================================================
 
 st.divider()
 
 st.info(
     """
-Persistence model:
+**Persistence model**
 
-1. Ubuntu is stored under /tmp/shl-runtime/ubuntu.
-2. Changes are detected by the filesystem watcher.
-3. After changes, a compressed Ubuntu snapshot is created.
-4. The snapshot is split into GitHub-safe chunks.
-5. Chunks are uploaded to the shl-persistent branch.
-6. manifest.json records the snapshot.
-7. After a Streamlit runtime rebuild, the snapshot is downloaded.
-8. Ubuntu is reconstructed before PRoot starts.
-9. Installed packages, /root files, /etc configuration,
-   scripts and other persistent Ubuntu files are restored.
+Ubuntu files are stored temporarily inside the Streamlit
+runtime and periodically snapshotted to the GitHub
+`shl-persistent` branch.
 
-The operating-system process itself cannot survive a
-Streamlit runtime destruction. The filesystem/state can
-be reconstructed automatically from GitHub.
+After a new runtime starts, SHL restores the latest snapshot,
+then starts PRoot and SSHX again.
+
+The SSHX process itself cannot survive destruction of the
+Streamlit runtime. The filesystem/configuration can be
+restored, but the old SSHX process/session cannot remain alive
+after the underlying runtime is terminated.
 """
+)
+
+
+# ============================================================
+# FOOTER
+# ============================================================
+
+st.caption(
+    "SHL • Persistent Ubuntu • "
+    "GitHub-backed state • "
+    f"{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}"
 )
