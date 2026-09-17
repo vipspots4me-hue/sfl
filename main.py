@@ -1,88 +1,45 @@
-import atexit
-import bz2
-import json
 import os
-import platform
-import re
-import shutil
-import signal
-import stat
-import subprocess
 import sys
-import tarfile
-import threading
+import json
 import time
-import urllib.error
+import signal
+import shutil
+import tarfile
+import hashlib
+import logging
+import subprocess
+import threading
 import urllib.request
+import urllib.error
+import base64
 from pathlib import Path
+from datetime import datetime, timezone
 
 import streamlit as st
 
 
 # ============================================================
-# SHL - Persistent Ubuntu 22.04 + PRoot + SSHX + Restic + R2
-# ============================================================
-#
-# این برنامه یک محیط Ubuntu 22.04.5 را داخل Streamlit ایجاد می‌کند.
-#
-# Persistence:
-#   Cloudflare R2
-#       ↓
-#   Restic encrypted snapshots
-#       ↓
-#   Ubuntu rootfs
-#
-# نکته مهم:
-# - فایل‌ها، تنظیمات، نصب پکیج‌ها و داده‌های داخل Ubuntu ذخیره می‌شوند.
-# - پردازش‌های در حال اجرا بعد از نابودی Runtime قابل ذخیره نیستند.
-# - سرویس‌های ثبت‌شده در /etc/shl/services بعد از راه‌اندازی مجدد
-#   دوباره اجرا می‌شوند.
-# - SIGKILL ناگهانی ممکن است آخرین چند ثانیه تغییرات را قبل از Snapshot
-#   از بین ببرد؛ برای همین Backup خودکار با تأخیر کوتاه انجام می‌شود.
-#
-# سیستم قدیمی persistent-state/*.tar.gz عمداً در این نسخه وجود ندارد.
-# ============================================================
-
-
-# ============================================================
-# PATHS
+# SHL - GitHub Persistent Ubuntu Server
 # ============================================================
 
 BASE_DIR = Path("/tmp/shl-runtime")
 
 ROOTFS_DIR = BASE_DIR / "ubuntu"
-
-PRoot_DIR = BASE_DIR / "proot"
-PROOT_PATH = PRoot_DIR / "proot"
-
-RESTIC_DIR = BASE_DIR / "restic"
-RESTIC_PATH = RESTIC_DIR / "restic"
-RESTIC_CACHE_DIR = BASE_DIR / "restic-cache"
-
-RESTORE_DIR = BASE_DIR / "restore"
+PROOT_DIR = BASE_DIR / "proot"
+PROOT_PATH = PROOT_DIR / "proot"
 
 SSHX_DIR = Path.home() / ".local" / "bin"
 SSHX_PATH = SSHX_DIR / "sshx"
 
-SSHX_PID_FILE = BASE_DIR / "sshx.pid"
-SSHX_LINK_FILE = BASE_DIR / "sshx.link"
-SSHX_LOG_FILE = BASE_DIR / "sshx.log"
+RESTORE_DIR = BASE_DIR / "restore"
 
-SUPERVISOR_LOCK = BASE_DIR / "supervisor.lock"
-BACKUP_LOCK = BASE_DIR / "backup.lock"
+STATE_DIR = BASE_DIR / "state"
+STATE_DIR.mkdir(parents=True, exist_ok=True)
 
-BACKUP_STATE = BASE_DIR / "backup-state.json"
+LOCK_FILE = STATE_DIR / "backup.lock"
+BACKUP_STATUS_FILE = STATE_DIR / "backup-status.json"
 
 SERVICE_DIR = ROOTFS_DIR / "etc" / "shl" / "services"
-
-BOOTSTRAP_MARKER = BASE_DIR / "bootstrap-complete"
-
-BASE_DIR.mkdir(parents=True, exist_ok=True)
-
-
-# ============================================================
-# DOWNLOAD URLS
-# ============================================================
 
 UBUNTU_URL = (
     "https://cdimage.ubuntu.com/ubuntu-base/releases/22.04/release/"
@@ -96,21 +53,811 @@ PROOT_URL = (
 
 SSHX_INSTALL_URL = "https://sshx.io/get"
 
-RESTIC_API_URL = (
-    "https://api.github.com/repos/restic/restic/releases/latest"
+GITHUB_API = "https://api.github.com"
+
+# Keep chunks safely below GitHub's 100 MB single-file limit.
+CHUNK_SIZE = 40 * 1024 * 1024
+
+# Persistent state branch.
+STATE_BRANCH_DEFAULT = "shl-persistent"
+
+BACKUP_INTERVAL = 180
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="[SHL] %(asctime)s %(levelname)s %(message)s",
+)
+
+log = logging.getLogger("SHL")
+
+
+# ============================================================
+# SECRETS
+# ============================================================
+
+def secret(name, default=None):
+    try:
+        value = st.secrets.get(name)
+        if value:
+            return str(value)
+    except Exception:
+        pass
+
+    value = os.environ.get(name)
+    if value:
+        return value
+
+    return default
+
+
+GITHUB_TOKEN = secret("GITHUB_TOKEN")
+GITHUB_REPO = secret("GITHUB_REPO", "vipspots4me-hue/sfl")
+GITHUB_BRANCH = secret("GITHUB_BRANCH", "main")
+GITHUB_STATE_BRANCH = secret(
+    "GITHUB_STATE_BRANCH",
+    STATE_BRANCH_DEFAULT,
 )
 
 
 # ============================================================
-# SETTINGS
+# PATH HELPERS
 # ============================================================
 
-BACKUP_DEBOUNCE_SECONDS = 5
-BACKUP_MAX_INTERVAL_SECONDS = 120
+def ensure_dirs():
+    BASE_DIR.mkdir(parents=True, exist_ok=True)
+    ROOTFS_DIR.parent.mkdir(parents=True, exist_ok=True)
+    PROOT_DIR.mkdir(parents=True, exist_ok=True)
+    SSHX_DIR.mkdir(parents=True, exist_ok=True)
+    RESTORE_DIR.mkdir(parents=True, exist_ok=True)
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
 
-# پکیج‌های پایه‌ای که فقط هنگام ساخت Ubuntu جدید نصب می‌شوند.
-# بعد از Restore روی محیط موجود دوباره apt اجرا نمی‌کنیم تا
-# Restore واقعاً همان Snapshot را حفظ کند.
+
+# ============================================================
+# DOWNLOAD
+# ============================================================
+
+def download_file(url, destination):
+    destination = Path(destination)
+
+    if destination.exists() and destination.stat().st_size > 1024:
+        return destination
+
+    tmp = destination.with_suffix(destination.suffix + ".tmp")
+
+    log.info("Downloading: %s", url)
+
+    request = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": "SHL/1.0",
+        },
+    )
+
+    with urllib.request.urlopen(request, timeout=120) as response:
+        with open(tmp, "wb") as f:
+            while True:
+                data = response.read(1024 * 1024)
+                if not data:
+                    break
+                f.write(data)
+
+    tmp.replace(destination)
+
+    return destination
+
+
+# ============================================================
+# PROOT
+# ============================================================
+
+def install_proot():
+    ensure_dirs()
+
+    if PROOT_PATH.exists():
+        PROOT_PATH.chmod(0o755)
+        return
+
+    log.info("Downloading PRoot...")
+
+    download_file(PROOT_URL, PROOT_PATH)
+
+    PROOT_PATH.chmod(0o755)
+
+    result = subprocess.run(
+        [str(PROOT_PATH), "--version"],
+        capture_output=True,
+        text=True,
+    )
+
+    if result.returncode != 0:
+        raise RuntimeError(
+            "PRoot installation failed:\n"
+            + result.stderr
+        )
+
+    log.info("PRoot installed.")
+
+
+# ============================================================
+# UBUNTU BASE
+# ============================================================
+
+def ubuntu_exists():
+    return (
+        ROOTFS_DIR.exists()
+        and (ROOTFS_DIR / "bin").exists()
+        and (ROOTFS_DIR / "etc" / "os-release").exists()
+    )
+
+
+def extract_ubuntu_base():
+    ensure_dirs()
+
+    if ubuntu_exists():
+        return
+
+    archive = BASE_DIR / "ubuntu-base.tar.gz"
+
+    log.info("Downloading Ubuntu 22.04 base...")
+
+    download_file(UBUNTU_URL, archive)
+
+    temp_root = BASE_DIR / "ubuntu-new"
+
+    if temp_root.exists():
+        shutil.rmtree(temp_root)
+
+    temp_root.mkdir(parents=True)
+
+    log.info("Extracting Ubuntu...")
+
+    with tarfile.open(archive, "r:gz") as tar:
+        tar.extractall(temp_root)
+
+    temp_root.replace(ROOTFS_DIR)
+
+    log.info("Ubuntu base installed.")
+
+
+# ============================================================
+# GITHUB API
+# ============================================================
+
+class GitHubError(Exception):
+    pass
+
+
+class GitHub:
+    def __init__(self):
+        if not GITHUB_TOKEN:
+            raise GitHubError(
+                "GITHUB_TOKEN is missing from Streamlit Secrets."
+            )
+
+        self.repo = GITHUB_REPO
+        self.token = GITHUB_TOKEN
+
+    def request(self, method, path, data=None):
+        url = GITHUB_API + path
+
+        headers = {
+            "Authorization": f"Bearer {self.token}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+            "User-Agent": "SHL-Persistent-Server",
+        }
+
+        body = None
+
+        if data is not None:
+            body = json.dumps(data).encode("utf-8")
+            headers["Content-Type"] = "application/json"
+
+        req = urllib.request.Request(
+            url,
+            data=body,
+            headers=headers,
+            method=method,
+        )
+
+        try:
+            with urllib.request.urlopen(req, timeout=120) as response:
+                raw = response.read()
+
+                if not raw:
+                    return None
+
+                return json.loads(raw.decode("utf-8"))
+
+        except urllib.error.HTTPError as e:
+            error_body = e.read().decode("utf-8", errors="replace")
+
+            raise GitHubError(
+                f"GitHub HTTP {e.code}: {error_body}"
+            )
+
+    def get_branch(self, branch):
+        return self.request(
+            "GET",
+            f"/repos/{self.repo}/branches/{branch}",
+        )
+
+    def branch_exists(self, branch):
+        try:
+            self.get_branch(branch)
+            return True
+        except GitHubError:
+            return False
+
+    def get_file(self, path, branch):
+        encoded = urllib.parse.quote(path, safe="/")
+
+        return self.request(
+            "GET",
+            f"/repos/{self.repo}/contents/{encoded}?ref={urllib.parse.quote(branch)}",
+        )
+
+    def create_or_update_file(
+        self,
+        path,
+        content_bytes,
+        branch,
+        message,
+    ):
+        encoded = urllib.parse.quote(path, safe="/")
+
+        sha = None
+
+        try:
+            existing = self.get_file(path, branch)
+
+            if isinstance(existing, dict):
+                sha = existing.get("sha")
+
+        except Exception:
+            pass
+
+        payload = {
+            "message": message,
+            "content": base64.b64encode(
+                content_bytes
+            ).decode("ascii"),
+            "branch": branch,
+        }
+
+        if sha:
+            payload["sha"] = sha
+
+        return self.request(
+            "PUT",
+            f"/repos/{self.repo}/contents/{encoded}",
+            payload,
+        )
+
+
+# urllib.parse is imported after class declaration intentionally.
+import urllib.parse
+
+
+# ============================================================
+# STATE BRANCH
+# ============================================================
+
+def ensure_state_branch():
+    gh = GitHub()
+
+    if gh.branch_exists(GITHUB_STATE_BRANCH):
+        return
+
+    log.info(
+        "Creating persistent branch: %s",
+        GITHUB_STATE_BRANCH,
+    )
+
+    main = gh.get_branch(GITHUB_BRANCH)
+
+    sha = main["commit"]["sha"]
+
+    gh.request(
+        "POST",
+        f"/repos/{GITHUB_REPO}/git/refs",
+        {
+            "ref": f"refs/heads/{GITHUB_STATE_BRANCH}",
+            "sha": sha,
+        },
+    )
+
+    log.info("Persistent branch created.")
+
+
+# ============================================================
+# SNAPSHOT
+# ============================================================
+
+def calculate_sha256(path):
+    h = hashlib.sha256()
+
+    with open(path, "rb") as f:
+        while True:
+            data = f.read(1024 * 1024)
+
+            if not data:
+                break
+
+            h.update(data)
+
+    return h.hexdigest()
+
+
+def create_snapshot():
+    ensure_dirs()
+
+    snapshot = BASE_DIR / "ubuntu-snapshot.tar.gz"
+
+    if snapshot.exists():
+        snapshot.unlink()
+
+    log.info("Creating Ubuntu snapshot...")
+
+    # Exclude volatile runtime directories.
+    exclude_names = {
+        "proc",
+        "sys",
+        "dev",
+        "run",
+        "tmp",
+        "mnt",
+        "media",
+    }
+
+    def filter_members(tar):
+        for member in tar:
+            parts = Path(member.name).parts
+
+            if parts and parts[0] in exclude_names:
+                continue
+
+            yield member
+
+    with tarfile.open(
+        snapshot,
+        "w:gz",
+        compresslevel=6,
+    ) as tar:
+        for member in filter_members(
+            tarfile.open(ROOTFS_DIR, "r")
+        ):
+            tar.add(
+                ROOTFS_DIR / member.name,
+                arcname=member.name,
+                recursive=False,
+            )
+
+    size = snapshot.stat().st_size
+    sha = calculate_sha256(snapshot)
+
+    log.info(
+        "Snapshot created: %.2f MB",
+        size / 1024 / 1024,
+    )
+
+    return snapshot, sha
+
+
+# ============================================================
+# SNAPSHOT CHUNKS
+# ============================================================
+
+def split_snapshot(snapshot):
+    snapshot = Path(snapshot)
+
+    chunks = []
+
+    with open(snapshot, "rb") as f:
+        index = 0
+
+        while True:
+            data = f.read(CHUNK_SIZE)
+
+            if not data:
+                break
+
+            chunk = BASE_DIR / (
+                f"ubuntu-snapshot.part-{index:04d}"
+            )
+
+            with open(chunk, "wb") as out:
+                out.write(data)
+
+            chunks.append(chunk)
+
+            index += 1
+
+    return chunks
+
+
+# ============================================================
+# UPLOAD SNAPSHOT
+# ============================================================
+
+def upload_snapshot(snapshot, sha):
+    gh = GitHub()
+
+    ensure_state_branch()
+
+    chunks = split_snapshot(snapshot)
+
+    timestamp = datetime.now(
+        timezone.utc
+    ).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    manifest = {
+        "format": 1,
+        "created_at": timestamp,
+        "snapshot_sha256": sha,
+        "snapshot_size": snapshot.stat().st_size,
+        "chunk_size": CHUNK_SIZE,
+        "chunks": [
+            chunk.name
+            for chunk in chunks
+        ],
+    }
+
+    log.info(
+        "Uploading %d snapshot chunks to GitHub...",
+        len(chunks),
+    )
+
+    # Manifest first.
+    gh.create_or_update_file(
+        ".shl-state/manifest.json",
+        json.dumps(
+            manifest,
+            indent=2,
+        ).encode(),
+        GITHUB_STATE_BRANCH,
+        f"SHL snapshot {timestamp}",
+    )
+
+    for i, chunk in enumerate(chunks):
+        log.info(
+            "Uploading chunk %d/%d...",
+            i + 1,
+            len(chunks),
+        )
+
+        with open(chunk, "rb") as f:
+            data = f.read()
+
+        gh.create_or_update_file(
+            f".shl-state/{chunk.name}",
+            data,
+            GITHUB_STATE_BRANCH,
+            f"SHL snapshot chunk {i + 1}/{len(chunks)}",
+        )
+
+    return manifest
+
+
+# ============================================================
+# RESTORE
+# ============================================================
+
+def download_github_file(gh, path, branch):
+    result = gh.get_file(path, branch)
+
+    if not isinstance(result, dict):
+        raise GitHubError(
+            f"Invalid GitHub file response: {path}"
+        )
+
+    if result.get("encoding") != "base64":
+        raise GitHubError(
+            f"Unexpected GitHub encoding: {path}"
+        )
+
+    content = result.get("content", "")
+
+    return base64.b64decode(
+        content.replace("\n", "")
+    )
+
+
+def restore_snapshot():
+    gh = GitHub()
+
+    if not gh.branch_exists(GITHUB_STATE_BRANCH):
+        log.info("No persistent state branch yet.")
+        return False
+
+    try:
+        manifest_bytes = download_github_file(
+            gh,
+            ".shl-state/manifest.json",
+            GITHUB_STATE_BRANCH,
+        )
+    except Exception as e:
+        log.info(
+            "No previous SHL snapshot found: %s",
+            e,
+        )
+        return False
+
+    manifest = json.loads(
+        manifest_bytes.decode("utf-8")
+    )
+
+    chunks = manifest.get("chunks", [])
+
+    if not chunks:
+        return False
+
+    archive = BASE_DIR / "restored-ubuntu.tar.gz"
+
+    if archive.exists():
+        archive.unlink()
+
+    log.info(
+        "Restoring snapshot from GitHub..."
+    )
+
+    with open(archive, "wb") as out:
+        for i, filename in enumerate(chunks):
+            log.info(
+                "Downloading chunk %d/%d...",
+                i + 1,
+                len(chunks),
+            )
+
+            data = download_github_file(
+                gh,
+                f".shl-state/{filename}",
+                GITHUB_STATE_BRANCH,
+            )
+
+            out.write(data)
+
+    actual_sha = calculate_sha256(archive)
+
+    expected_sha = manifest.get(
+        "snapshot_sha256"
+    )
+
+    if expected_sha and actual_sha != expected_sha:
+        raise RuntimeError(
+            "GitHub snapshot SHA256 mismatch."
+        )
+
+    temp_root = BASE_DIR / "ubuntu-restored"
+
+    if temp_root.exists():
+        shutil.rmtree(temp_root)
+
+    temp_root.mkdir(parents=True)
+
+    log.info("Extracting persistent Ubuntu...")
+
+    with tarfile.open(
+        archive,
+        "r:gz",
+    ) as tar:
+        tar.extractall(temp_root)
+
+    if not (
+        temp_root / "etc" / "os-release"
+    ).exists():
+        raise RuntimeError(
+            "Restored Ubuntu filesystem is invalid."
+        )
+
+    if ROOTFS_DIR.exists():
+        shutil.rmtree(ROOTFS_DIR)
+
+    temp_root.replace(ROOTFS_DIR)
+
+    log.info(
+        "Ubuntu restored successfully."
+    )
+
+    return True
+
+
+# ============================================================
+# BACKUP
+# ============================================================
+
+backup_lock = threading.Lock()
+
+
+def write_backup_status(status, **extra):
+    data = {
+        "status": status,
+        "time": datetime.now(
+            timezone.utc
+        ).isoformat(),
+    }
+
+    data.update(extra)
+
+    BACKUP_STATUS_FILE.write_text(
+        json.dumps(
+            data,
+            indent=2,
+        )
+    )
+
+
+def backup_now(reason="manual"):
+    if not GITHUB_TOKEN:
+        raise RuntimeError(
+            "GITHUB_TOKEN is missing."
+        )
+
+    if not ubuntu_exists():
+        raise RuntimeError(
+            "Ubuntu filesystem does not exist."
+        )
+
+    if not backup_lock.acquire(
+        blocking=False
+    ):
+        log.info(
+            "Backup already running."
+        )
+        return False
+
+    try:
+        write_backup_status(
+            "running",
+            reason=reason,
+        )
+
+        log.info(
+            "Starting persistent GitHub backup..."
+        )
+
+        snapshot, sha = create_snapshot()
+
+        manifest = upload_snapshot(
+            snapshot,
+            sha,
+        )
+
+        write_backup_status(
+            "success",
+            reason=reason,
+            sha256=sha,
+            size=snapshot.stat().st_size,
+            chunks=len(
+                manifest["chunks"]
+            ),
+        )
+
+        log.info(
+            "Persistent GitHub backup completed."
+        )
+
+        return True
+
+    except Exception as e:
+        write_backup_status(
+            "failed",
+            reason=reason,
+            error=str(e),
+        )
+
+        log.exception(
+            "Backup failed."
+        )
+
+        return False
+
+    finally:
+        backup_lock.release()
+
+
+# ============================================================
+# UBUNTU CONFIG
+# ============================================================
+
+def configure_ubuntu():
+    etc = ROOTFS_DIR / "etc"
+
+    hostname = etc / "hostname"
+
+    if not hostname.exists():
+        hostname.write_text("shl-server\n")
+
+    hosts = etc / "hosts"
+
+    if not hosts.exists():
+        hosts.write_text(
+            "127.0.0.1 localhost\n"
+            "127.0.1.1 shl-server\n"
+            "::1 localhost ip6-localhost ip6-loopback\n"
+        )
+
+    resolv = etc / "resolv.conf"
+
+    try:
+        if resolv.exists() or resolv.is_symlink():
+            resolv.unlink()
+
+        resolv.write_text(
+            "nameserver 1.1.1.1\n"
+            "nameserver 8.8.8.8\n"
+        )
+    except Exception:
+        pass
+
+
+# ============================================================
+# UBUNTU COMMAND
+# ============================================================
+
+def ubuntu_command(
+    command,
+    check=True,
+    capture=False,
+):
+    env = os.environ.copy()
+
+    env.update(
+        {
+            "HOME": "/root",
+            "USER": "root",
+            "TERM": "xterm-256color",
+        }
+    )
+
+    args = [
+        str(PROOT_PATH),
+        "-0",
+        "-r",
+        str(ROOTFS_DIR),
+        "-w",
+        "/root",
+        "-b",
+        "/dev",
+        "-b",
+        "/proc",
+        "-b",
+        "/sys",
+        "-b",
+        "/tmp",
+        "-b",
+        "/run",
+        "-b",
+        "/etc/resolv.conf",
+        "/usr/bin/env",
+        "-i",
+        "HOME=/root",
+        "USER=root",
+        "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        "TERM=xterm-256color",
+        "/bin/bash",
+        "-lc",
+        command,
+    ]
+
+    log.info(
+        "Ubuntu: %s",
+        command,
+    )
+
+    return subprocess.run(
+        args,
+        env=env,
+        check=check,
+        capture_output=capture,
+        text=True,
+    )
+
+
+# ============================================================
+# BASE PACKAGES
+# ============================================================
+
 BASE_PACKAGES = [
     "bash",
     "ca-certificates",
@@ -132,551 +879,13 @@ BASE_PACKAGES = [
     "sudo",
 ]
 
-shutdown_started = False
 
-
-# ============================================================
-# LOGGING
-# ============================================================
-
-def log(message):
-    print(f"[SHL] {message}", flush=True)
-
-
-# ============================================================
-# STREAMLIT SECRETS
-# ============================================================
-
-def get_secret(name):
-    """
-    ابتدا Streamlit Secrets و سپس environment variable را بررسی می‌کند.
-    """
-
-    try:
-        value = st.secrets.get(name)
-        if value is not None and str(value).strip():
-            return str(value).strip()
-    except Exception:
-        pass
-
-    value = os.environ.get(name)
-
-    if value and value.strip():
-        return value.strip()
-
-    return None
-
-
-def get_r2_settings():
-    """
-    تنظیمات Cloudflare R2 را از Streamlit Secrets می‌خواند.
-    """
-
-    account_id = get_secret("R2_ACCOUNT_ID")
-    access_key = get_secret("R2_ACCESS_KEY_ID")
-    secret_key = get_secret("R2_SECRET_ACCESS_KEY")
-    bucket = get_secret("R2_BUCKET")
-    restic_password = get_secret("RESTIC_PASSWORD")
-
-    missing = []
-
-    if not account_id:
-        missing.append("R2_ACCOUNT_ID")
-
-    if not access_key:
-        missing.append("R2_ACCESS_KEY_ID")
-
-    if not secret_key:
-        missing.append("R2_SECRET_ACCESS_KEY")
-
-    if not bucket:
-        missing.append("R2_BUCKET")
-
-    if not restic_password:
-        missing.append("RESTIC_PASSWORD")
-
-    if missing:
-        return None, missing
-
-    repository = (
-        f"s3:https://{account_id}.r2.cloudflarestorage.com/{bucket}"
-    )
-
-    return {
-        "account_id": account_id,
-        "access_key": access_key,
-        "secret_key": secret_key,
-        "bucket": bucket,
-        "password": restic_password,
-        "repository": repository,
-    }, []
-
-
-# ============================================================
-# ARCHITECTURE
-# ============================================================
-
-def detect_arch():
-    machine = platform.machine().lower()
-
-    if machine in ("x86_64", "amd64"):
-        return "x86_64"
-
-    if machine in ("aarch64", "arm64"):
-        return "aarch64"
-
-    return machine
-
-
-# ============================================================
-# FILE DOWNLOAD
-# ============================================================
-
-def download_file(url, destination, executable=False):
-    destination = Path(destination)
-    destination.parent.mkdir(parents=True, exist_ok=True)
-
-    temporary = destination.with_suffix(
-        destination.suffix + ".download"
-    )
-
-    if temporary.exists():
-        temporary.unlink()
-
-    log(f"Downloading: {url}")
-
-    request = urllib.request.Request(
-        url,
-        headers={
-            "User-Agent": "SHL-Streamlit/1.0"
-        },
-    )
-
-    with urllib.request.urlopen(request, timeout=120) as response:
-        total = response.headers.get("Content-Length")
-
-        if total:
-            total = int(total)
-
-        downloaded = 0
-
-        with open(temporary, "wb") as f:
-            while True:
-                chunk = response.read(1024 * 1024)
-
-                if not chunk:
-                    break
-
-                f.write(chunk)
-                downloaded += len(chunk)
-
-                if total:
-                    percent = downloaded * 100 / total
-
-                    print(
-                        f"\r[SHL] Download: {percent:5.1f}%",
-                        end="",
-                        flush=True,
-                    )
-
-    if total:
-        print("", flush=True)
-
-    temporary.replace(destination)
-
-    if executable:
-        mode = destination.stat().st_mode
-        destination.chmod(
-            mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH
-        )
-
-
-# ============================================================
-# LOCK
-# ============================================================
-
-class FileLock:
-    """
-    قفل ساده برای جلوگیری از اجرای همزمان چند عملیات سنگین.
-    """
-
-    def __init__(self, path, timeout=300):
-        self.path = Path(path)
-        self.timeout = timeout
-        self.fd = None
-
-    def acquire(self):
-        start = time.time()
-
-        while True:
-            try:
-                self.fd = os.open(
-                    self.path,
-                    os.O_CREAT | os.O_EXCL | os.O_WRONLY,
-                )
-
-                os.write(
-                    self.fd,
-                    str(os.getpid()).encode(),
-                )
-
-                return True
-
-            except FileExistsError:
-
-                if time.time() - start > self.timeout:
-                    try:
-                        self.path.unlink()
-                    except Exception:
-                        pass
-
-                    continue
-
-                time.sleep(0.5)
-
-    def release(self):
-        if self.fd is not None:
-            try:
-                os.close(self.fd)
-            except Exception:
-                pass
-
-            self.fd = None
-
-        try:
-            self.path.unlink()
-        except Exception:
-            pass
-
-    def __enter__(self):
-        self.acquire()
-        return self
-
-    def __exit__(self, exc_type, exc, tb):
-        self.release()
-
-
-# ============================================================
-# COMMAND RUNNER
-# ============================================================
-
-def run_command(
-    command,
-    timeout=300,
-    cwd=None,
-    env=None,
-    check=False,
-):
-    log("$ " + " ".join(map(str, command)))
-
-    process = subprocess.run(
-        [str(x) for x in command],
-        cwd=str(cwd) if cwd else None,
-        env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        timeout=timeout,
-    )
-
-    output = process.stdout or ""
-
-    if output:
-        print(output, end="", flush=True)
-
-    if check and process.returncode != 0:
-        raise RuntimeError(
-            f"Command failed with exit code "
-            f"{process.returncode}"
-        )
-
-    return process.returncode, output
-
-
-# ============================================================
-# UBUNTU INSTALL
-# ============================================================
-
-def ubuntu_exists():
-    return (
-        ROOTFS_DIR.is_dir()
-        and (ROOTFS_DIR / "bin" / "bash").exists()
-        and (ROOTFS_DIR / "etc" / "os-release").exists()
-    )
-
-
-def install_ubuntu():
-    """
-    Ubuntu Base را فقط زمانی نصب می‌کند که Restore موفقی وجود نداشته باشد.
-    """
-
-    with FileLock(BASE_DIR / "ubuntu-install.lock", timeout=600):
-
-        if ubuntu_exists():
-            return
-
-        log("No Ubuntu rootfs found.")
-
-        archive = BASE_DIR / "ubuntu-base.tar.gz"
-
-        if not archive.exists():
-            log("Downloading Ubuntu 22.04.5 Base...")
-            download_file(
-                UBUNTU_URL,
-                archive,
-                executable=False,
-            )
-
-        temporary_rootfs = BASE_DIR / "ubuntu-new"
-
-        if temporary_rootfs.exists():
-            shutil.rmtree(temporary_rootfs)
-
-        temporary_rootfs.mkdir(parents=True)
-
-        log("Extracting Ubuntu 22.04.5...")
-
-        with tarfile.open(
-            archive,
-            "r:gz",
-        ) as tar:
-            tar.extractall(temporary_rootfs)
-
-        if not (
-            temporary_rootfs / "bin" / "bash"
-        ).exists():
-
-            nested = temporary_rootfs / "ubuntu-base"
-
-            if nested.exists():
-                extracted = nested
-            else:
-                extracted = temporary_rootfs
-
-        else:
-            extracted = temporary_rootfs
-
-        if ROOTFS_DIR.exists():
-            shutil.rmtree(ROOTFS_DIR)
-
-        extracted.rename(ROOTFS_DIR)
-
-        if temporary_rootfs.exists():
-            shutil.rmtree(
-                temporary_rootfs,
-                ignore_errors=True,
-            )
-
-        configure_ubuntu(initial=True)
-
-        log("Ubuntu base installation completed.")
-
-
-# ============================================================
-# UBUNTU CONFIGURATION
-# ============================================================
-
-def configure_ubuntu(initial=False):
-    """
-    تنظیمات ضروری Ubuntu.
-
-    در Restore مجدد فایل‌های موجود را بی‌دلیل overwrite نمی‌کنیم.
-    این موضوع برای حفظ تغییرات کاربر مهم است.
-    """
-
-    etc = ROOTFS_DIR / "etc"
-    etc.mkdir(parents=True, exist_ok=True)
-
-    hostname = etc / "hostname"
-    hosts = etc / "hosts"
-    resolv = etc / "resolv.conf"
-
-    if initial:
-
-        hostname.write_text(
-            "localhost\n",
-            encoding="utf-8",
-        )
-
-        hosts.write_text(
-            "127.0.0.1 localhost\n"
-            "127.0.1.1 localhost\n"
-            "::1 localhost ip6-localhost ip6-loopback\n",
-            encoding="utf-8",
-        )
-
-        # فقط اگر فایل وجود ندارد ایجاد می‌کنیم.
-        # بعد از Restore تنظیمات کاربر overwrite نمی‌شود.
-        if not resolv.exists():
-            resolv.write_text(
-                "nameserver 1.1.1.1\n"
-                "nameserver 8.8.8.8\n",
-                encoding="utf-8",
-            )
-
-    SERVICE_DIR.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-
-# ============================================================
-# PROOT
-# ============================================================
-
-def install_proot():
-    if PROOT_PATH.exists():
-        log("PRoot already installed.")
-        return
-
-    PRoot_DIR.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    arch = detect_arch()
-
-    if arch != "x86_64":
-        raise RuntimeError(
-            f"Unsupported architecture for current PRoot binary: {arch}"
-        )
-
-    log("Downloading PRoot...")
-
-    download_file(
-        PROOT_URL,
-        PROOT_PATH,
-        executable=True,
-    )
-
-    log("PRoot installed.")
-
-
-def proot_command(command):
-    """
-    command را داخل Ubuntu اجرا می‌کند.
-    """
-
-    return [
-        str(PROOT_PATH),
-        "-0",
-        "-r",
-        str(ROOTFS_DIR),
-        "-b",
-        "/dev",
-        "-b",
-        "/dev/pts",
-        "-b",
-        "/proc",
-        "-b",
-        "/sys",
-        "-b",
-        "/etc/resolv.conf:/etc/resolv.conf",
-        "-w",
-        "/root",
-        "/usr/bin/env",
-        "-i",
-        "HOME=/root",
-        "USER=root",
-        "LOGNAME=root",
-        "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-        "TERM=xterm-256color",
-        "LANG=C.UTF-8",
-        *command,
-    ]
-
-
-def run_ubuntu(
-    command,
-    timeout=300,
-    check=False,
-):
-    return run_command(
-        proot_command(command),
-        timeout=timeout,
-        check=check,
-    )
-
-
-def test_ubuntu():
-    code, output = run_ubuntu(
-        [
-            "/bin/bash",
-            "-lc",
-            (
-                "echo SHL_UBUNTU_OK; "
-                "echo USER=$(id -un); "
-                "echo UID=$(id -u); "
-                "echo OS=$(grep PRETTY_NAME /etc/os-release); "
-                "echo ARCH=$(uname -m)"
-            ),
-        ],
-        timeout=60,
-    )
-
-    return code == 0, output
-
-
-# ============================================================
-# FIRST INSTALL PACKAGES
-# ============================================================
-
-def package_installed(package):
-    code, _ = run_ubuntu(
-        [
-            "/bin/bash",
-            "-lc",
-            f"dpkg-query -W -f='${{Status}}' {package} "
-            "| grep -q 'install ok installed'",
-        ],
-        timeout=30,
-    )
-
-    return code == 0
-
-
-def ensure_base_packages():
-    """
-    این تابع فقط برای Ubuntu جدید استفاده می‌شود.
-    بعد از Restore دیگر apt را بدون دلیل اجرا نمی‌کنیم.
-    """
-
-    marker = ROOTFS_DIR / "etc" / "shl" / ".base-packages-installed"
-
-    if marker.exists():
-        log("All required packages already installed.")
-        return
-
-    log("Installing Ubuntu base packages...")
-
-    run_ubuntu(
-        [
-            "/bin/bash",
-            "-lc",
-            (
-                "export DEBIAN_FRONTEND=noninteractive && "
-                "apt-get update"
-            ),
-        ],
-        timeout=600,
-        check=True,
-    )
-
-    package_string = " ".join(
-        BASE_PACKAGES
-    )
-
-    run_ubuntu(
-        [
-            "/bin/bash",
-            "-lc",
-            (
-                "export DEBIAN_FRONTEND=noninteractive && "
-                f"apt-get install -y {package_string}"
-            ),
-        ],
-        timeout=1200,
-        check=True,
+def install_base_packages():
+    marker = (
+        ROOTFS_DIR
+        / "etc"
+        / "shl"
+        / ".base-packages-installed"
     )
 
     marker.parent.mkdir(
@@ -684,849 +893,39 @@ def ensure_base_packages():
         exist_ok=True,
     )
 
-    marker.write_text(
-        f"installed_at={time.time()}\n",
-        encoding="utf-8",
-    )
-
-    log("Base packages installed.")
-
-
-# ============================================================
-# RESTIC INSTALL
-# ============================================================
-
-def get_latest_restic_asset():
-
-    request = urllib.request.Request(
-        RESTIC_API_URL,
-        headers={
-            "User-Agent": "SHL-Streamlit/1.0"
-        },
-    )
-
-    with urllib.request.urlopen(
-        request,
-        timeout=60,
-    ) as response:
-
-        data = json.loads(
-            response.read().decode("utf-8")
+    if marker.exists():
+        log.info(
+            "Base packages already installed."
         )
-
-    arch = detect_arch()
-
-    if arch == "x86_64":
-        wanted = "linux_amd64"
-
-    elif arch == "aarch64":
-        wanted = "linux_arm64"
-
-    else:
-        raise RuntimeError(
-            f"Unsupported architecture: {arch}"
-        )
-
-    for asset in data.get("assets", []):
-        name = asset.get("name", "")
-
-        if (
-            wanted in name
-            and name.endswith(".bz2")
-            and "restic_" in name
-        ):
-            return (
-                data.get("tag_name", ""),
-                asset.get("browser_download_url"),
-            )
-
-    raise RuntimeError(
-        "Could not find Restic Linux asset."
-    )
-
-
-def install_restic():
-
-    if RESTIC_PATH.exists():
-        code, output = run_command(
-            [
-                str(RESTIC_PATH),
-                "version",
-            ],
-            timeout=30,
-        )
-
-        if code == 0:
-            log(
-                "Restic already installed: "
-                + output.strip().splitlines()[0]
-            )
-            return
-
-    RESTIC_DIR.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    log("Architecture: " + detect_arch())
-    log("Downloading Restic...")
-
-    version, url = get_latest_restic_asset()
-
-    compressed = RESTIC_DIR / "restic.bz2"
-
-    download_file(
-        url,
-        compressed,
-    )
-
-    log("Extracting Restic...")
-
-    with bz2.open(
-        compressed,
-        "rb",
-    ) as src, open(
-        RESTIC_PATH,
-        "wb",
-    ) as dst:
-
-        shutil.copyfileobj(
-            src,
-            dst,
-        )
-
-    RESTIC_PATH.chmod(0o755)
-
-    try:
-        compressed.unlink()
-    except Exception:
-        pass
-
-    code, output = run_command(
-        [
-            str(RESTIC_PATH),
-            "version",
-        ],
-        timeout=30,
-        check=True,
-    )
-
-    log(
-        "Restic installed: "
-        + output.strip().splitlines()[0]
-    )
-
-
-# ============================================================
-# RESTIC ENVIRONMENT
-# ============================================================
-
-def restic_env():
-
-    settings, missing = get_r2_settings()
-
-    if settings is None:
-        raise RuntimeError(
-            "R2 secrets missing: "
-            + ", ".join(missing)
-        )
-
-    env = os.environ.copy()
-
-    env["RESTIC_REPOSITORY"] = settings["repository"]
-    env["RESTIC_PASSWORD"] = settings["password"]
-
-    env["AWS_ACCESS_KEY_ID"] = settings["access_key"]
-    env["AWS_SECRET_ACCESS_KEY"] = settings["secret_key"]
-
-    # Cloudflare R2
-    env["AWS_DEFAULT_REGION"] = "auto"
-
-    env["RESTIC_CACHE_DIR"] = str(
-        RESTIC_CACHE_DIR
-    )
-
-    RESTIC_CACHE_DIR.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    return env
-
-
-def restic_command(args):
-
-    return [
-        str(RESTIC_PATH),
-        "-o",
-        "s3.region=auto",
-        *args,
-    ]
-
-
-# ============================================================
-# RESTIC REPOSITORY
-# ============================================================
-
-def restic_repository_exists():
-
-    try:
-        env = restic_env()
-    except Exception:
-        return False
-
-    code, _ = run_command(
-        restic_command(
-            [
-                "snapshots",
-                "--last",
-            ]
-        ),
-        timeout=180,
-        env=env,
-    )
-
-    return code == 0
-
-
-def ensure_restic_repository():
-
-    settings, missing = get_r2_settings()
-
-    if settings is None:
-        log(
-            "R2 secrets are missing: "
-            + ", ".join(missing)
-        )
-
-        return False
-
-    log("R2 configuration detected.")
-
-    env = restic_env()
-
-    code, output = run_command(
-        restic_command(
-            [
-                "snapshots",
-                "--last",
-            ]
-        ),
-        timeout=180,
-        env=env,
-    )
-
-    if code == 0:
-        log("Restic repository is available.")
-        return True
-
-    log("Restic repository does not exist.")
-
-    log("Initializing Restic repository...")
-
-    code, output = run_command(
-        restic_command(
-            [
-                "init",
-            ]
-        ),
-        timeout=300,
-        env=env,
-    )
-
-    if code != 0:
-        raise RuntimeError(
-            "Restic repository initialization failed."
-        )
-
-    log("Restic repository initialized.")
-
-    return True
-
-
-# ============================================================
-# RESTORE
-# ============================================================
-
-def find_restored_rootfs(base):
-    """
-    Restic معمولاً مسیر absolute را زیر target بازسازی می‌کند:
-        target/tmp/shl-runtime/ubuntu
-
-    این تابع آن مسیر را به شکل مطمئن پیدا می‌کند.
-    """
-
-    expected = (
-        base
-        / "tmp"
-        / "shl-runtime"
-        / "ubuntu"
-    )
-
-    if (
-        expected.is_dir()
-        and (expected / "bin" / "bash").exists()
-    ):
-        return expected
-
-    # fallback برای snapshotهایی که مسیر متفاوتی داشته‌اند.
-    for bash in base.rglob("bash"):
-
-        if bash.name != "bash":
-            continue
-
-        if bash.parent.name != "bin":
-            continue
-
-        candidate = bash.parent.parent
-
-        if (
-            (candidate / "etc" / "os-release").exists()
-            and (candidate / "bin" / "bash").exists()
-        ):
-            return candidate
-
-    return None
-
-
-def restore_latest():
-
-    if not ensure_restic_repository():
-        return False
-
-    env = restic_env()
-
-    if RESTORE_DIR.exists():
-        shutil.rmtree(
-            RESTORE_DIR,
-            ignore_errors=True,
-        )
-
-    RESTORE_DIR.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    log("Restoring latest Ubuntu snapshot...")
-
-    code, output = run_command(
-        restic_command(
-            [
-                "restore",
-                "latest",
-                "--target",
-                str(RESTORE_DIR),
-                "--tag",
-                "shl-ubuntu",
-            ]
-        ),
-        timeout=1800,
-        env=env,
-    )
-
-    if code != 0:
-        log("Restic restore failed.")
-        return False
-
-    restored = find_restored_rootfs(
-        RESTORE_DIR
-    )
-
-    if restored is None:
-        log(
-            "Restore completed but Ubuntu rootfs "
-            "could not be located."
-        )
-
-        return False
-
-    log(
-        "Restored Ubuntu rootfs from: "
-        + str(restored)
-    )
-
-    if ROOTFS_DIR.exists():
-        shutil.rmtree(
-            ROOTFS_DIR,
-            ignore_errors=True,
-        )
-
-    ROOTFS_DIR.parent.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    shutil.move(
-        str(restored),
-        str(ROOTFS_DIR),
-    )
-
-    configure_ubuntu(
-        initial=False
-    )
-
-    shutil.rmtree(
-        RESTORE_DIR,
-        ignore_errors=True,
-    )
-
-    log("Ubuntu rootfs restored successfully.")
-
-    return True
-
-
-# ============================================================
-# BACKUP
-# ============================================================
-
-def backup_ubuntu(reason="manual"):
-
-    if not ubuntu_exists():
-        log("Backup skipped: Ubuntu rootfs does not exist.")
-        return False
-
-    settings, missing = get_r2_settings()
-
-    if settings is None:
-        log(
-            "Backup skipped: R2 secrets missing: "
-            + ", ".join(missing)
-        )
-
-        return False
-
-    with FileLock(
-        BACKUP_LOCK,
-        timeout=1800,
-    ):
-
-        env = restic_env()
-
-        log(
-            f"Creating Ubuntu persistent backup "
-            f"(reason={reason})..."
-        )
-
-        command = restic_command(
-            [
-                "backup",
-                str(ROOTFS_DIR),
-                "--tag",
-                "shl-ubuntu",
-                "--tag",
-                f"reason-{reason}",
-                "--compression",
-                "auto",
-            ]
-        )
-
-        code, output = run_command(
-            command,
-            timeout=1800,
-            env=env,
-        )
-
-        if code != 0:
-            log("Ubuntu backup FAILED.")
-            return False
-
-        # آخرین زمان Backup موفق
-        state = {
-            "timestamp": time.time(),
-            "reason": reason,
-            "pid": os.getpid(),
-        }
-
-        BACKUP_STATE.write_text(
-            json.dumps(
-                state,
-                indent=2,
-            ),
-            encoding="utf-8",
-        )
-
-        log("Ubuntu backup created.")
-
-        return True
-
-
-# ============================================================
-# BACKUP WORKER
-# ============================================================
-
-class BackupController:
-
-    def __init__(self):
-
-        self.stop_event = threading.Event()
-        self.change_event = threading.Event()
-
-        self.lock = threading.Lock()
-
-        self.last_request = 0.0
-        self.last_backup = 0.0
-
-        self.thread = None
-
-    def request(self, reason="filesystem-change"):
-
-        with self.lock:
-            self.last_request = time.time()
-
-        self.change_event.set()
-
-    def start(self):
-
-        if (
-            self.thread is not None
-            and self.thread.is_alive()
-        ):
-            return
-
-        self.thread = threading.Thread(
-            target=self.worker,
-            name="shl-backup-worker",
-            daemon=True,
-        )
-
-        self.thread.start()
-
-        log("Backup worker started.")
-
-    def stop(self):
-
-        self.stop_event.set()
-        self.change_event.set()
-
-    def worker(self):
-
-        while not self.stop_event.is_set():
-
-            self.change_event.wait(
-                timeout=10
-            )
-
-            if self.stop_event.is_set():
-                break
-
-            with self.lock:
-                request_time = self.last_request
-
-            if request_time <= 0:
-                continue
-
-            # صبر می‌کنیم تا تغییرات پشت سر هم تمام شوند.
-            while not self.stop_event.is_set():
-
-                time.sleep(
-                    BACKUP_DEBOUNCE_SECONDS
-                )
-
-                with self.lock:
-                    latest_request = self.last_request
-
-                if (
-                    latest_request
-                    == request_time
-                ):
-                    break
-
-                request_time = latest_request
-
-            if self.stop_event.is_set():
-                break
-
-            if request_time <= self.last_backup:
-                self.change_event.clear()
-                continue
-
-            success = backup_ubuntu(
-                "filesystem-change"
-            )
-
-            if success:
-                self.last_backup = time.time()
-
-            self.change_event.clear()
-
-
-# ============================================================
-# WATCHDOG
-# ============================================================
-
-class SHLFileWatcher:
-
-    def __init__(self, controller):
-        self.controller = controller
-        self.observer = None
-
-    def start(self):
-
-        try:
-            from watchdog.events import (
-                FileSystemEventHandler
-            )
-            from watchdog.observers import Observer
-
-        except ImportError:
-            log(
-                "watchdog is not installed; "
-                "automatic filesystem backup disabled."
-            )
-            return
-
-        controller = self.controller
-
-        class Handler(FileSystemEventHandler):
-
-            def _changed(self, path):
-
-                # فایل‌های موقت Restic یا موارد غیرمرتبط
-                # نباید Watcher را وارد loop کنند.
-                try:
-                    resolved = Path(path).resolve()
-                except Exception:
-                    return
-
-                if str(resolved).startswith(
-                    str(RESTORE_DIR.resolve())
-                ):
-                    return
-
-                controller.request(
-                    "filesystem-change"
-                )
-
-            def on_created(self, event):
-                if not event.is_directory:
-                    self._changed(event.src_path)
-
-            def on_modified(self, event):
-                if not event.is_directory:
-                    self._changed(event.src_path)
-
-            def on_deleted(self, event):
-                if not event.is_directory:
-                    self._changed(event.src_path)
-
-            def on_moved(self, event):
-                self._changed(event.src_path)
-                self._changed(event.dest_path)
-
-        handler = Handler()
-
-        self.observer = Observer()
-
-        self.observer.schedule(
-            handler,
-            str(ROOTFS_DIR),
-            recursive=True,
-        )
-
-        self.observer.daemon = True
-        self.observer.start()
-
-        log(
-            "Filesystem watcher started."
-        )
-
-    def stop(self):
-
-        if self.observer is not None:
-
-            try:
-                self.observer.stop()
-                self.observer.join(
-                    timeout=5
-                )
-            except Exception:
-                pass
-
-
-# ============================================================
-# SERVICE MANAGER
-# ============================================================
-
-def create_service_manager():
-
-    SERVICE_DIR.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    script = ROOTFS_DIR / "usr" / "local" / "bin" / "shlctl"
-
-    script.parent.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    content = r'''#!/bin/bash
-
-SERVICE_DIR="/etc/shl/services"
-
-case "$1" in
-    list)
-        echo "===== SHL SERVICES ====="
-        for f in "$SERVICE_DIR"/*.json; do
-            [ -f "$f" ] || continue
-            basename "$f" .json
-        done
-        ;;
-
-    show)
-        NAME="$2"
-        cat "$SERVICE_DIR/$NAME.json"
-        ;;
-
-    *)
-        echo "SHL service manager"
-        echo
-        echo "Usage:"
-        echo "  shlctl list"
-        echo "  shlctl show SERVICE"
-        ;;
-esac
-'''
-
-    current = None
-
-    if script.exists():
-        try:
-            current = script.read_text(
-                encoding="utf-8"
-            )
-        except Exception:
-            current = None
-
-    if current != content:
-        script.write_text(
-            content,
-            encoding="utf-8",
-        )
-
-    script.chmod(0o755)
-
-
-def list_services():
-
-    if not SERVICE_DIR.exists():
-        return []
-
-    result = []
-
-    for file in sorted(
-        SERVICE_DIR.glob("*.json")
-    ):
-
-        try:
-            data = json.loads(
-                file.read_text(
-                    encoding="utf-8"
-                )
-            )
-
-            result.append(data)
-
-        except Exception:
-            continue
-
-    return result
-
-
-def start_service(service):
-
-    name = service.get("name")
-
-    if not name:
-        return False, "Service name is missing."
-
-    command = service.get("command")
-
-    if not command:
-        return False, "Service command is missing."
-
-    workdir = service.get(
-        "working_dir",
-        "/root",
-    )
-
-    env_data = service.get(
-        "environment",
-        {},
-    )
-
-    env_exports = ""
-
-    for key, value in env_data.items():
-
-        safe_key = re.sub(
-            r"[^A-Za-z0-9_]",
-            "",
-            str(key),
-        )
-
-        safe_value = str(value).replace(
-            "'",
-            "'\"'\"'"
-        )
-
-        env_exports += (
-            f"export {safe_key}='{safe_value}'; "
-        )
-
-    # سرویس داخل Ubuntu اجرا می‌شود.
-    shell = (
-        "set -a; "
-        f"{env_exports}"
-        "set +a; "
-        f"cd '{workdir}' 2>/dev/null || exit 1; "
-        f"exec {command}"
-    )
-
-    log(
-        f"Starting service: {name}"
-    )
-
-    process = subprocess.Popen(
-        proot_command(
-            [
-                "/bin/bash",
-                "-lc",
-                shell,
-            ]
-        ),
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        stdin=subprocess.DEVNULL,
-        start_new_session=True,
-    )
-
-    return True, str(process.pid)
-
-
-def start_persistent_services():
-
-    services = list_services()
-
-    if not services:
         return
 
-    for service in services:
+    packages = " ".join(BASE_PACKAGES)
 
-        if not service.get(
-            "enabled",
-            True,
-        ):
-            continue
+    result = ubuntu_command(
+        "export DEBIAN_FRONTEND=noninteractive; "
+        "apt-get update && "
+        f"apt-get install -y {packages}",
+        check=False,
+        capture=True,
+    )
 
-        try:
-            start_service(service)
-        except Exception as exc:
-            log(
-                f"Could not start service "
-                f"{service.get('name')}: {exc}"
-            )
+    if result.returncode != 0:
+        log.error(result.stdout)
+        log.error(result.stderr)
+
+        raise RuntimeError(
+            "Ubuntu base package installation failed."
+        )
+
+    marker.write_text(
+        datetime.now(
+            timezone.utc
+        ).isoformat()
+    )
+
+    log.info(
+        "Base packages installed."
+    )
 
 
 # ============================================================
@@ -1534,460 +933,367 @@ def start_persistent_services():
 # ============================================================
 
 def install_sshx():
-
     SSHX_DIR.mkdir(
         parents=True,
         exist_ok=True,
     )
 
     if SSHX_PATH.exists():
-        try:
-            SSHX_PATH.chmod(0o755)
-        except Exception:
-            pass
+        SSHX_PATH.chmod(0o755)
+        return
 
-        log(
-            f"SSHX already installed: "
-            f"{SSHX_PATH}"
+    log.info("Installing SSHX...")
+
+    request = urllib.request.Request(
+        SSHX_INSTALL_URL,
+        headers={
+            "User-Agent": "SHL/1.0",
+        },
+    )
+
+    proc = subprocess.run(
+        [
+            "bash",
+            "-c",
+            "curl -sSf https://sshx.io/get | sh",
+        ],
+        capture_output=True,
+        text=True,
+        env={
+            **os.environ,
+            "HOME": str(Path.home()),
+        },
+    )
+
+    if proc.stdout:
+        log.info(proc.stdout)
+
+    if proc.stderr:
+        log.info(proc.stderr)
+
+    if proc.returncode != 0:
+        raise RuntimeError(
+            "SSHX installation failed."
         )
 
-        return True
+    if not SSHX_PATH.exists():
+        found = shutil.which("sshx")
 
-    log("Installing SSHX...")
-
-    try:
-
-        request = urllib.request.Request(
-            SSHX_INSTALL_URL,
-            headers={
-                "User-Agent": "SHL-Streamlit/1.0"
-            },
-        )
-
-        process = subprocess.run(
-            [
-                "bash",
-                "-c",
-                (
-                    "curl -sSf "
-                    f"{SSHX_INSTALL_URL} | "
-                    "sh"
-                ),
-            ],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            timeout=300,
-        )
-
-        if process.stdout:
-            print(
-                process.stdout,
-                end="",
-                flush=True,
+        if found:
+            shutil.copy2(
+                found,
+                SSHX_PATH,
             )
 
-        if process.returncode != 0:
-            return False
-
-        # sshx installer معمولاً این مسیر را استفاده می‌کند.
-        if not SSHX_PATH.exists():
-
-            candidates = [
-                Path.home()
-                / ".local"
-                / "bin"
-                / "sshx",
-
-                Path("/usr/local/bin/sshx"),
-            ]
-
-            for candidate in candidates:
-
-                if candidate.exists():
-                    if candidate != SSHX_PATH:
-                        shutil.copy2(
-                            candidate,
-                            SSHX_PATH,
-                        )
-                    break
-
-        if SSHX_PATH.exists():
-            SSHX_PATH.chmod(0o755)
-            log("SSHX installed.")
-            return True
-
-    except Exception as exc:
-        log(
-            f"SSHX installation error: {exc}"
+    if not SSHX_PATH.exists():
+        raise RuntimeError(
+            "SSHX executable was not found."
         )
 
-    return False
+    SSHX_PATH.chmod(0o755)
 
 
 def sshx_running():
+    pid_file = STATE_DIR / "sshx.pid"
 
-    if not SSHX_PID_FILE.exists():
-        return False, None
+    if not pid_file.exists():
+        return False
 
     try:
         pid = int(
-            SSHX_PID_FILE.read_text().strip()
+            pid_file.read_text().strip()
         )
 
-        os.kill(
-            pid,
-            0,
-        )
-
-        return True, pid
-
-    except Exception:
-        try:
-            SSHX_PID_FILE.unlink()
-        except Exception:
-            pass
-
-        return False, None
-
-
-def start_sshx():
-
-    running, pid = sshx_running()
-
-    if running:
-        log(
-            f"SSHX already running: PID={pid}"
-        )
+        os.kill(pid, 0)
 
         return True
 
-    if not SSHX_PATH.exists():
+    except Exception:
+        try:
+            pid_file.unlink()
+        except Exception:
+            pass
 
-        if not install_sshx():
-            log("SSHX executable not found.")
-            return False
+        return False
 
-    SSHX_LOG_FILE.parent.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
 
-    log("Starting SSHX...")
+def start_sshx():
+    install_sshx()
 
-    log_file = open(
-        SSHX_LOG_FILE,
+    if sshx_running():
+        log.info(
+            "SSHX already running."
+        )
+        return
+
+    pid_file = STATE_DIR / "sshx.pid"
+    log_file = STATE_DIR / "sshx.log"
+    link_file = STATE_DIR / "sshx.link"
+
+    log_handle = open(
+        log_file,
         "a",
-        encoding="utf-8",
+        buffering=1,
     )
 
-    process = subprocess.Popen(
+    proc = subprocess.Popen(
         [
             str(SSHX_PATH),
             "run",
         ],
-        stdin=subprocess.DEVNULL,
-        stdout=log_file,
+        stdout=log_handle,
         stderr=subprocess.STDOUT,
+        stdin=subprocess.DEVNULL,
         start_new_session=True,
-        cwd=str(BASE_DIR),
     )
 
-    SSHX_PID_FILE.write_text(
-        str(process.pid),
-        encoding="utf-8",
+    pid_file.write_text(
+        str(proc.pid)
     )
 
-    log(
-        f"SSHX started: PID={process.pid}"
+    log.info(
+        "SSHX started. PID=%s",
+        proc.pid,
     )
 
-    # چند ثانیه برای دریافت لینک
-    # منتظر می‌مانیم.
-    for _ in range(20):
+    # Give SSHX a moment to print its URL.
+    def find_link():
+        for _ in range(30):
+            time.sleep(1)
 
-        time.sleep(0.5)
+            try:
+                text = log_file.read_text(
+                    errors="ignore"
+                )
 
-        if SSHX_LINK_FILE.exists():
-            break
+                for line in text.splitlines():
+                    if "https://" in line:
+                        pos = line.find("https://")
 
+                        link = line[pos:].split()[0]
+
+                        link_file.write_text(
+                            link
+                        )
+
+                        log.info(
+                            "SSHX link: %s",
+                            link,
+                        )
+
+                        return
+
+            except Exception:
+                pass
+
+    threading.Thread(
+        target=find_link,
+        daemon=True,
+    ).start()
+
+
+# ============================================================
+# PERSISTENT SERVICES
+# ============================================================
+
+def start_persistent_services():
+    if not SERVICE_DIR.exists():
+        return
+
+    for definition in SERVICE_DIR.glob(
+        "*.json"
+    ):
         try:
-            text = SSHX_LOG_FILE.read_text(
-                encoding="utf-8",
-                errors="ignore",
+            data = json.loads(
+                definition.read_text()
             )
 
-            # تلاش برای پیدا کردن لینک sshx
-            matches = re.findall(
-                r"https?://[^\s]+",
-                text,
+            name = data.get("name")
+            command = data.get("command")
+
+            if not name or not command:
+                continue
+
+            pid_file = STATE_DIR / (
+                f"service-{name}.pid"
             )
 
-            for url in matches:
+            running = False
 
-                if "sshx.io" in url:
-
-                    SSHX_LINK_FILE.write_text(
-                        url.rstrip(".,)"),
-                        encoding="utf-8",
+            if pid_file.exists():
+                try:
+                    pid = int(
+                        pid_file.read_text()
                     )
 
-                    break
+                    os.kill(pid, 0)
+
+                    running = True
+
+                except Exception:
+                    pass
+
+            if running:
+                continue
+
+            log_file = STATE_DIR / (
+                f"service-{name}.log"
+            )
+
+            handle = open(
+                log_file,
+                "a",
+                buffering=1,
+            )
+
+            proc = subprocess.Popen(
+                [
+                    str(PROOT_PATH),
+                    "-0",
+                    "-r",
+                    str(ROOTFS_DIR),
+                    "-w",
+                    "/root",
+                    "-b",
+                    "/dev",
+                    "-b",
+                    "/proc",
+                    "-b",
+                    "/sys",
+                    "-b",
+                    "/tmp",
+                    "/bin/bash",
+                    "-lc",
+                    command,
+                ],
+                stdout=handle,
+                stderr=subprocess.STDOUT,
+                stdin=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+
+            pid_file.write_text(
+                str(proc.pid)
+            )
+
+            log.info(
+                "Persistent service started: %s",
+                name,
+            )
 
         except Exception:
-            pass
-
-    return True
+            log.exception(
+                "Could not start service: %s",
+                definition,
+            )
 
 
 # ============================================================
-# BOOTSTRAP
+# INITIALIZATION
 # ============================================================
 
-def bootstrap():
-
-    log(
-        "========================================"
-    )
-    log(
-        "SHL persistent Ubuntu bootstrap"
-    )
-    log(
-        "========================================"
-    )
-
-    log(
-        "Detected architecture: "
-        + detect_arch()
-    )
-
-    # --------------------------------------------------------
-    # Restic
-    # --------------------------------------------------------
-
-    install_restic()
-
-    r2_settings, missing = get_r2_settings()
-
-    if r2_settings is None:
-
-        log(
-            "R2 secrets are missing: "
-            + ", ".join(missing)
-        )
-
-    else:
-
-        # ----------------------------------------------------
-        # Restore FIRST
-        # ----------------------------------------------------
-
-        if not ubuntu_exists():
-
-            log(
-                "Ubuntu rootfs does not exist. "
-                "Trying Restic restore..."
-            )
-
-            restored = restore_latest()
-
-            if not restored:
-                log(
-                    "No usable Restic snapshot found."
-                )
-
-        # ----------------------------------------------------
-        # Fresh install only if Restore failed
-        # ----------------------------------------------------
-
-        if not ubuntu_exists():
-
-            log(
-                "Creating fresh Ubuntu environment..."
-            )
-
-            install_ubuntu()
-
-            # فقط محیط جدید
-            ensure_base_packages()
-
-            configure_ubuntu(
-                initial=False
-            )
-
-            create_service_manager()
-
-            # اولین Backup
-            if r2_settings is not None:
-                backup_ubuntu(
-                    "initial"
-                )
-
-        else:
-
-            log(
-                "Existing/restored Ubuntu environment found."
-            )
-
-            configure_ubuntu(
-                initial=False
-            )
-
-            create_service_manager()
-
-            # Restore شده است؛ پکیج‌ها را دوباره نصب نمی‌کنیم.
-            # این قسمت باعث حفظ دقیق Snapshot می‌شود.
-
-    # --------------------------------------------------------
-    # PRoot
-    # --------------------------------------------------------
+@st.cache_resource
+def initialize_server():
+    ensure_dirs()
 
     install_proot()
 
-    ok, output = test_ubuntu()
+    restored = False
 
-    if not ok:
-        raise RuntimeError(
-            "Ubuntu/PRoot test failed."
-        )
+    if GITHUB_TOKEN:
+        try:
+            restored = restore_snapshot()
+        except Exception:
+            log.exception(
+                "GitHub restore failed."
+            )
 
-    # --------------------------------------------------------
-    # Persistent services
-    # --------------------------------------------------------
+    if not restored:
+        extract_ubuntu_base()
+        configure_ubuntu()
+        install_base_packages()
 
-    start_persistent_services()
+    else:
+        configure_ubuntu()
 
-    # --------------------------------------------------------
-    # SSHX
-    # --------------------------------------------------------
-
-    start_sshx()
-
-    # --------------------------------------------------------
-    # Backup supervisor
-    # --------------------------------------------------------
-
-    start_backup_system()
-
-    log(
-        "SHL Ubuntu environment is ready."
-    )
+    return restored
 
 
 # ============================================================
-# GLOBAL SUPERVISOR
+# BACKGROUND BACKUP
 # ============================================================
 
 @st.cache_resource
-def start_backup_system():
+def start_backup_worker():
+    stop_event = threading.Event()
 
-    controller = BackupController()
+    def worker():
+        last_backup = 0
 
-    controller.start()
+        while not stop_event.is_set():
+            now = time.time()
 
-    watcher = SHLFileWatcher(
-        controller
+            if (
+                now - last_backup
+                >= BACKUP_INTERVAL
+            ):
+                if GITHUB_TOKEN and ubuntu_exists():
+                    success = backup_now(
+                        "automatic"
+                    )
+
+                    if success:
+                        last_backup = time.time()
+
+            stop_event.wait(10)
+
+    thread = threading.Thread(
+        target=worker,
+        daemon=True,
+        name="SHL-GitHub-Backup",
     )
 
-    watcher.start()
+    thread.start()
 
-    # این دو object با cache_resource
-    # در rerunهای Streamlit دوباره ساخته نمی‌شوند.
-    supervisor = {
-        "controller": controller,
-        "watcher": watcher,
-    }
-
-    return supervisor
+    return stop_event
 
 
 # ============================================================
-# SHUTDOWN
+# SYSTEM INFO
 # ============================================================
 
-def final_backup():
+def get_os_info():
+    path = ROOTFS_DIR / "etc" / "os-release"
 
-    global shutdown_started
+    if not path.exists():
+        return "Ubuntu unavailable"
 
-    if shutdown_started:
-        return
-
-    shutdown_started = True
-
-    log(
-        "Shutdown detected. "
-        "Creating final persistent backup..."
+    data = path.read_text(
+        errors="ignore"
     )
 
-    try:
-        backup_ubuntu(
-            "shutdown"
-        )
-    except Exception as exc:
-        log(
-            f"Final backup failed: {exc}"
-        )
+    for line in data.splitlines():
+        if line.startswith(
+            "PRETTY_NAME="
+        ):
+            return line.split(
+                "=",
+                1,
+            )[1].strip('"')
+
+    return "Ubuntu"
 
 
-def signal_handler(signum, frame):
-
-    final_backup()
-
-    # به Streamlit اجازه می‌دهیم shutdown خودش را انجام دهد.
-    raise SystemExit(0)
-
-
-def install_shutdown_handlers():
+def get_backup_status():
+    if not BACKUP_STATUS_FILE.exists():
+        return {}
 
     try:
-        signal.signal(
-            signal.SIGTERM,
-            signal_handler,
+        return json.loads(
+            BACKUP_STATUS_FILE.read_text()
         )
     except Exception:
-        pass
-
-    try:
-        signal.signal(
-            signal.SIGINT,
-            signal_handler,
-        )
-    except Exception:
-        pass
-
-    # atexit فقط برای shutdown عادی است.
-    atexit.register(
-        final_backup
-    )
-
-
-# ============================================================
-# RUN BOOTSTRAP ONLY ONCE PER STREAMLIT PROCESS
-# ============================================================
-
-@st.cache_resource
-def run_bootstrap_once():
-
-    bootstrap()
-
-    return True
-
-
-install_shutdown_handlers()
-
-try:
-    run_bootstrap_once()
-except Exception as exc:
-
-    log(
-        f"BOOTSTRAP ERROR: {exc}"
-    )
-
-    st.error(
-        f"SHL bootstrap failed: {exc}"
-    )
-
-    st.stop()
+        return {}
 
 
 # ============================================================
@@ -1995,453 +1301,252 @@ except Exception as exc:
 # ============================================================
 
 st.set_page_config(
-    page_title="SHL Persistent Ubuntu",
-    page_icon="🐧",
+    page_title="SHL Persistent Server",
+    page_icon="🖥️",
     layout="wide",
 )
 
-
-st.title(
-    "🐧 SHL Persistent Ubuntu"
-)
+st.title("🖥️ SHL Persistent Server")
 
 st.caption(
-    "Ubuntu 22.04.5 + PRoot + SSHX + Restic + Cloudflare R2"
+    "Ubuntu 22.04 + PRoot + GitHub Persistent Storage"
 )
+
+
+if not GITHUB_TOKEN:
+    st.error(
+        "GITHUB_TOKEN در Streamlit Secrets پیدا نشد."
+    )
+
+    st.code(
+        """GITHUB_TOKEN = "..."
+GITHUB_REPO = "vipspots4me-hue/sfl"
+GITHUB_BRANCH = "main"
+GITHUB_STATE_BRANCH = "shl-persistent"
+""",
+        language="toml",
+    )
+
+    st.stop()
+
+
+# Initialize.
+try:
+    restored = initialize_server()
+except Exception as e:
+    st.exception(e)
+    st.stop()
+
+
+# Start worker.
+start_backup_worker()
+
+
+# Start SSHX.
+try:
+    start_sshx()
+except Exception as e:
+    log.error(
+        "SSHX startup failed: %s",
+        e,
+    )
+
+
+# Start saved services.
+try:
+    start_persistent_services()
+except Exception:
+    log.exception(
+        "Persistent service startup failed."
+    )
 
 
 # ============================================================
 # STATUS
 # ============================================================
 
-st.subheader(
-    "Environment"
-)
-
-col1, col2, col3 = st.columns(3)
+col1, col2, col3, col4 = st.columns(4)
 
 with col1:
-    st.write(
-        "**Ubuntu:**",
-        "22.04.5 LTS"
-        if ubuntu_exists()
-        else "Not found",
+    st.metric(
+        "Ubuntu",
+        get_os_info(),
     )
 
 with col2:
-    st.write(
-        "**Architecture:**",
-        detect_arch(),
+    st.metric(
+        "Architecture",
+        "x86_64",
     )
 
 with col3:
+    st.metric(
+        "Persistence",
+        "GitHub",
+    )
 
-    running, pid = sshx_running()
-
-    st.write(
-        "**SSHX:**",
-        f"Running (PID {pid})"
-        if running
-        else "Not running",
+with col4:
+    st.metric(
+        "State Branch",
+        GITHUB_STATE_BRANCH,
     )
 
 
-# ============================================================
-# R2 STATUS
-# ============================================================
-
-st.subheader(
-    "☁️ Persistent Storage"
-)
-
-settings, missing = get_r2_settings()
-
-if settings is None:
-
-    st.error(
-        "Cloudflare R2 is not configured."
-    )
-
-    st.code(
-        "\n".join(
-            [
-                "R2_ACCOUNT_ID = \"...\"",
-                "R2_ACCESS_KEY_ID = \"...\"",
-                "R2_SECRET_ACCESS_KEY = \"...\"",
-                "R2_BUCKET = \"...\"",
-                "RESTIC_PASSWORD = \"...\"",
-            ]
-        ),
-        language="toml",
-    )
-
-    st.warning(
-        "Missing: "
-        + ", ".join(missing)
-    )
-
-else:
-
+if restored:
     st.success(
-        f"R2 configured — bucket: {settings['bucket']}"
+        "آخرین وضعیت Ubuntu از GitHub بازیابی شد."
+    )
+else:
+    st.info(
+        "Ubuntu جدید ساخته شد. اولین Backup خودکار انجام خواهد شد."
     )
 
-    if BACKUP_STATE.exists():
-
-        try:
-            state = json.loads(
-                BACKUP_STATE.read_text(
-                    encoding="utf-8"
-                )
-            )
-
-            timestamp = state.get(
-                "timestamp",
-                0,
-            )
-
-            reason = state.get(
-                "reason",
-                "unknown",
-            )
-
-            st.write(
-                "Last successful local backup record:",
-                time.strftime(
-                    "%Y-%m-%d %H:%M:%S",
-                    time.localtime(timestamp),
-                ),
-                f"({reason})",
-            )
-
-        except Exception:
-            pass
-
 
 # ============================================================
-# ACTIONS
+# BACKUP CONTROL
 # ============================================================
 
-st.subheader(
-    "⚙️ Controls"
-)
+st.subheader("💾 Persistent Backup")
 
-col1, col2, col3 = st.columns(3)
+status = get_backup_status()
 
+if status:
+    st.json(status)
 
-with col1:
-
-    if st.button(
-        "🧪 Test Ubuntu",
-        use_container_width=True,
+if st.button(
+    "💾 Backup Now",
+    use_container_width=True,
+):
+    with st.spinner(
+        "در حال Backup کامل Ubuntu به GitHub..."
     ):
+        success = backup_now("manual")
 
-        ok, output = test_ubuntu()
-
-        if ok:
-            st.success(
-                "Ubuntu test successful."
-            )
-
-            st.code(
-                output,
-                language="text",
-            )
-
-        else:
-            st.error(
-                "Ubuntu test failed."
-            )
-
-            st.code(
-                output,
-                language="text",
-            )
-
-
-with col2:
-
-    if st.button(
-        "☁️ Backup Now",
-        use_container_width=True,
-    ):
-
-        with st.spinner(
-            "Creating Restic snapshot..."
-        ):
-
-            success = backup_ubuntu(
-                "manual"
-            )
-
-        if success:
-            st.success(
-                "Backup completed successfully."
-            )
-
-        else:
-            st.error(
-                "Backup failed."
-            )
-
-
-with col3:
-
-    if st.button(
-        "📸 Restic Snapshots",
-        use_container_width=True,
-    ):
-
-        try:
-
-            env = restic_env()
-
-            code, output = run_command(
-                restic_command(
-                    [
-                        "snapshots",
-                        "--tag",
-                        "shl-ubuntu",
-                    ]
-                ),
-                timeout=180,
-                env=env,
-            )
-
-            if code == 0:
-                st.code(
-                    output,
-                    language="text",
-                )
-            else:
-                st.error(
-                    "Could not read snapshots."
-                )
-
-        except Exception as exc:
-
-            st.error(
-                str(exc)
-            )
+    if success:
+        st.success(
+            "Backup با موفقیت در GitHub ذخیره شد."
+        )
+        st.rerun()
+    else:
+        st.error(
+            "Backup انجام نشد. Log را بررسی کن."
+        )
 
 
 # ============================================================
 # SSHX
 # ============================================================
 
-st.subheader(
-    "🔐 SSHX"
-)
+st.subheader("🔗 SSHX")
 
-if SSHX_LINK_FILE.exists():
+link_file = STATE_DIR / "sshx.link"
+log_file = STATE_DIR / "sshx.log"
 
-    try:
-        sshx_link = SSHX_LINK_FILE.read_text(
-            encoding="utf-8"
-        ).strip()
-    except Exception:
-        sshx_link = ""
+if link_file.exists():
+    link = link_file.read_text().strip()
 
-    if sshx_link:
-
+    if link:
         st.success(
-            "SSHX link:"
+            f"SSHX: {link}"
         )
 
-        st.code(
-            sshx_link,
-            language="text",
-        )
+        st.code(link)
 
 else:
-
     st.info(
-        "SSHX link has not been detected yet."
+        "لینک SSHX هنوز پیدا نشده است."
     )
 
 
-if SSHX_LOG_FILE.exists():
-
+if log_file.exists():
     with st.expander(
-        "SSHX log"
+        "SSHX Log"
     ):
-
-        try:
-            log_text = SSHX_LOG_FILE.read_text(
-                encoding="utf-8",
-                errors="ignore",
-            )
-
-            st.code(
-                log_text[-12000:],
-                language="text",
-            )
-
-        except Exception:
-            pass
-
-
-# ============================================================
-# SERVICE LIST
-# ============================================================
-
-st.subheader(
-    "🔄 Persistent Services"
-)
-
-services = list_services()
-
-if not services:
-
-    st.info(
-        "No persistent services are registered yet."
-    )
-
-else:
-
-    for service in services:
-
-        name = service.get(
-            "name",
-            "unknown",
-        )
-
-        command = service.get(
-            "command",
-            "",
-        )
-
-        enabled = service.get(
-            "enabled",
-            True,
-        )
-
-        st.write(
-            f"**{name}** — "
-            f"{'enabled' if enabled else 'disabled'}"
+        text = log_file.read_text(
+            errors="ignore"
         )
 
         st.code(
-            command,
-            language="bash",
+            text[-12000:]
         )
 
 
 # ============================================================
-# FILESYSTEM INFO
+# GITHUB CONFIG
 # ============================================================
 
-st.subheader(
-    "💾 Persistence Architecture"
+st.subheader("☁️ GitHub Persistence")
+
+st.write(
+    f"Repository: `{GITHUB_REPO}`"
 )
 
-st.markdown(
+st.write(
+    f"Code branch: `{GITHUB_BRANCH}`"
+)
+
+st.write(
+    f"Persistent branch: `{GITHUB_STATE_BRANCH}`"
+)
+
+st.success(
+    "تمام Snapshotهای دائمی داخل همین GitHub Repository ذخیره می‌شوند."
+)
+
+
+# ============================================================
+# UBUNTU TERMINAL
+# ============================================================
+
+st.subheader("🐧 Ubuntu")
+
+command = st.text_input(
+    "Ubuntu command",
+    value="neofetch",
+)
+
+if st.button(
+    "▶ Run",
+    use_container_width=True,
+):
+    result = ubuntu_command(
+        command,
+        check=False,
+        capture=True,
+    )
+
+    output = ""
+
+    if result.stdout:
+        output += result.stdout
+
+    if result.stderr:
+        output += result.stderr
+
+    st.code(
+        output or "(no output)"
+    )
+
+
+# ============================================================
+# FINAL INFORMATION
+# ============================================================
+
+st.divider()
+
+st.info(
     """
-**Runtime**
+نکته:
+تغییرات Ubuntu به صورت دوره‌ای روی Branch جداگانه
+به نام `shl-persistent` ذخیره می‌شوند.
 
-`Streamlit Cloud`
+بنابراین تغییر Backup باعث Deploy مجدد `main` نمی‌شود.
 
-↓
-
-**Userspace Linux**
-
-`PRoot`
-
-↓
-
-**Ubuntu**
-
-`Ubuntu 22.04.5 LTS`
-
-↓
-
-**Persistent storage**
-
-`Restic`
-
-↓
-
-**Cloud storage**
-
-`Cloudflare R2`
-
-### Automatic backup
-
-هر تغییر در فایل‌های Ubuntu توسط `watchdog` تشخیص داده می‌شود.
-
-بعد از حدود **۵ ثانیه بدون تغییر جدید** یک Snapshot ایجاد می‌شود.
-
-همچنین حداکثر فاصله Backup خودکار در نظر گرفته شده است.
-
-### Restore
-
-اگر Runtime جدید باشد و `/tmp/shl-runtime/ubuntu` وجود نداشته باشد:
-
-1. Restic repository بررسی می‌شود.
-2. آخرین Snapshot دارای tag `shl-ubuntu` پیدا می‌شود.
-3. Ubuntu rootfs از R2 بازیابی می‌شود.
-4. سپس PRoot روی همان rootfs اجرا می‌شود.
-
-### نکته
-
-پردازش‌های در حال اجرا قابل Snapshot شدن نیستند.
-
-مثلاً اگر Xray یا Argo در حال اجرا باشد، فایل‌ها و تنظیمات آن‌ها ذخیره می‌شود؛
-اما خود Process بعد از نابودی Runtime باید دوباره اجرا شود.
-سرویس‌های ثبت‌شده در `/etc/shl/services` برای همین منظور هستند.
+در Restart/Rebuild:
+1. Snapshot از GitHub خوانده می‌شود.
+2. Ubuntu قبلی Restore می‌شود.
+3. نصب‌ها و فایل‌ها برمی‌گردند.
+4. سرویس‌های ذخیره‌شده دوباره اجرا می‌شوند.
+5. SSHX دوباره اجرا می‌شود.
 """
 )
-
-
-# ============================================================
-# DEBUG
-# ============================================================
-
-with st.expander(
-    "🔧 Debug information"
-):
-
-    st.write(
-        "BASE_DIR:",
-        str(BASE_DIR),
-    )
-
-    st.write(
-        "ROOTFS_DIR:",
-        str(ROOTFS_DIR),
-    )
-
-    st.write(
-        "PRoot:",
-        str(PROOT_PATH),
-    )
-
-    st.write(
-        "Restic:",
-        str(RESTIC_PATH),
-    )
-
-    st.write(
-        "SSHX:",
-        str(SSHX_PATH),
-    )
-
-    st.write(
-        "Service directory:",
-        str(SERVICE_DIR),
-    )
-
-    if RESTIC_PATH.exists():
-
-        code, output = run_command(
-            [
-                str(RESTIC_PATH),
-                "version",
-            ],
-            timeout=30,
-        )
-
-        st.code(
-            output,
-            language="text",
-        )
