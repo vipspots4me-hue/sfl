@@ -4,7 +4,6 @@ import sys
 import time
 import tarfile
 import shutil
-import signal
 import platform
 import subprocess
 import threading
@@ -15,198 +14,699 @@ import streamlit as st
 
 
 # ============================================================
-# CONFIG
+# SHL SERVER
+# FreeRoot-style Ubuntu + PRoot + SSHX
 # ============================================================
 
-APP_DIR = Path.cwd()
+st.set_page_config(
+    page_title="SHL Server",
+    page_icon="🖥️",
+    layout="wide",
+)
 
-# Everything generated at runtime goes here.
-# It is NOT expected to survive Streamlit Reboot.
-RUNTIME_DIR = Path("/tmp/shl-runtime")
 
-FREEROOT_DIR = RUNTIME_DIR / "freeroot"
-ROOTFS_DIR = FREEROOT_DIR
+# ============================================================
+# PATHS
+# ============================================================
+
+RUNTIME = Path("/tmp/shl-runtime")
+
+ROOTFS = RUNTIME / "ubuntu"
+
+PROOT_DIR = RUNTIME / "proot"
+
+PROOT = PROOT_DIR / "proot"
+
+LOG_DIR = RUNTIME / "logs"
+
+STATE_DIR = RUNTIME / "state"
 
 SSHX_DIR = Path.home() / ".local" / "bin"
-SSHX_PATH = SSHX_DIR / "sshx"
+
+SSHX = SSHX_DIR / "sshx"
+
+
+# ============================================================
+# URLS
+# ============================================================
+
+UBUNTU_BASE_URL = (
+    "https://cdimage.ubuntu.com/"
+    "ubuntu-base/releases/22.04/release/"
+    "ubuntu-base-22.04.5-base-amd64.tar.gz"
+)
+
+PROOT_URL = (
+    "https://github.com/"
+    "Mytai20100/freeproot/releases/latest/download/"
+    "proot-amd64"
+)
 
 SSHX_URL = (
     "https://s3.amazonaws.com/sshx/"
     "sshx-x86_64-unknown-linux-musl.tar.gz"
 )
 
-FREEROOT_URL = (
-    "https://raw.githubusercontent.com/"
-    "Mytai20100/freeroot/main/noninteractive.sh"
-)
 
-STATE_DIR = RUNTIME_DIR / "state"
-LOG_DIR = RUNTIME_DIR / "logs"
+# ============================================================
+# MARKERS
+# ============================================================
 
-LOCK_FILE = STATE_DIR / "bootstrap.lock"
+ROOTFS_MARKER = ROOTFS / ".shl_rootfs_ready"
+
+PROOT_MARKER = PROOT_DIR / ".shl_proot_ready"
+
+SSHX_MARKER = STATE_DIR / ".sshx_ready"
 
 
 # ============================================================
-# HELPERS
+# LOGGING
 # ============================================================
 
-def log(msg):
-    print(f"[SHL] {msg}", flush=True)
-
-
-def command_exists(name):
-    return shutil.which(name) is not None
-
-
-def run_cmd(cmd, cwd=None, timeout=None, env=None):
-    log("$ " + " ".join(map(str, cmd)))
-
-    return subprocess.run(
-        cmd,
-        cwd=str(cwd) if cwd else None,
-        env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        timeout=timeout,
-        check=False,
+def log(message):
+    print(
+        f"[SHL] {message}",
+        flush=True,
     )
 
 
-def download(url, destination):
+def write_log(name, text):
+
+    LOG_DIR.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    try:
+        (LOG_DIR / name).write_text(
+            text,
+            errors="ignore",
+        )
+    except Exception:
+        pass
+
+
+# ============================================================
+# DOWNLOAD
+# ============================================================
+
+def download_file(
+    url,
+    destination,
+    label="file",
+):
+
     destination = Path(destination)
-    destination.parent.mkdir(parents=True, exist_ok=True)
 
-    tmp = destination.with_suffix(destination.suffix + ".tmp")
+    destination.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
 
-    log(f"Downloading: {url}")
+    temporary = destination.with_suffix(
+        destination.suffix + ".download"
+    )
 
-    urllib.request.urlretrieve(url, tmp)
+    if temporary.exists():
+        temporary.unlink()
 
-    if not tmp.exists() or tmp.stat().st_size < 1024:
-        raise RuntimeError(f"Download failed: {url}")
+    log(
+        f"Downloading {label}: {url}"
+    )
 
-    tmp.replace(destination)
+    try:
 
+        request = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent":
+                    "Mozilla/5.0 SHL-Server"
+            },
+        )
 
-# ============================================================
-# FREEROOT
-# ============================================================
+        with urllib.request.urlopen(
+            request,
+            timeout=60,
+        ) as response:
 
-def prepare_freeroot():
+            total = response.headers.get(
+                "Content-Length"
+            )
 
-    FREEROOT_DIR.mkdir(parents=True, exist_ok=True)
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
-    LOG_DIR.mkdir(parents=True, exist_ok=True)
+            total = (
+                int(total)
+                if total
+                else None
+            )
 
-    installed_marker = FREEROOT_DIR / ".installed"
+            downloaded = 0
 
-    if installed_marker.exists():
-        log("FreeRoot already installed in this runtime.")
+            with open(
+                temporary,
+                "wb",
+            ) as output:
+
+                while True:
+
+                    chunk = response.read(
+                        1024 * 1024
+                    )
+
+                    if not chunk:
+                        break
+
+                    output.write(chunk)
+
+                    downloaded += len(
+                        chunk
+                    )
+
+                    if total:
+
+                        percent = (
+                            downloaded
+                            * 100
+                            / total
+                        )
+
+                        log(
+                            f"{label}: "
+                            f"{percent:.1f}%"
+                        )
+
+        if not temporary.exists():
+            raise RuntimeError(
+                f"{label} download produced no file"
+            )
+
+        if temporary.stat().st_size < 1024:
+
+            raise RuntimeError(
+                f"{label} download is too small"
+            )
+
+        temporary.replace(
+            destination
+        )
+
         return True
 
-    log("Installing FreeRoot...")
+    except Exception as e:
 
-    script = FREEROOT_DIR / "noninteractive.sh"
+        log(
+            f"{label} download failed: {e}"
+        )
 
-    download(FREEROOT_URL, script)
-    script.chmod(0o755)
+        try:
+            temporary.unlink(
+                missing_ok=True
+            )
+        except Exception:
+            pass
 
-    # FreeRoot expects to be executed from its own directory.
-    result = run_cmd(
-        ["sh", str(script)],
-        cwd=FREEROOT_DIR,
-        timeout=900,
-    )
-
-    output = result.stdout or ""
-
-    (LOG_DIR / "freeroot-install.log").write_text(
-        output,
-        errors="ignore",
-    )
-
-    if result.returncode != 0:
-        log("FreeRoot installation failed.")
-        log(output[-5000:])
         return False
 
-    # noninteractive.sh normally creates this itself.
-    if not installed_marker.exists():
-        installed_marker.touch()
 
-    log("FreeRoot installation completed.")
+# ============================================================
+# ARCHITECTURE
+# ============================================================
+
+def check_architecture():
+
+    arch = platform.machine().lower()
+
+    log(
+        f"Detected architecture: {arch}"
+    )
+
+    if arch not in (
+        "x86_64",
+        "amd64",
+    ):
+
+        raise RuntimeError(
+            "This version currently supports "
+            "x86_64/amd64 only."
+        )
+
+    return "amd64"
+
+
+# ============================================================
+# PREPARE DIRECTORIES
+# ============================================================
+
+def prepare_directories():
+
+    RUNTIME.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    ROOTFS.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    PROOT_DIR.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    LOG_DIR.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    STATE_DIR.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+
+# ============================================================
+# UBUNTU ROOTFS
+# ============================================================
+
+def install_ubuntu():
+
+    if ROOTFS_MARKER.exists():
+
+        log(
+            "Ubuntu rootfs already exists."
+        )
+
+        return True
+
+    archive = (
+        RUNTIME
+        / "ubuntu-base.tar.gz"
+    )
+
+    log(
+        "Ubuntu rootfs is not installed."
+    )
+
+    if not download_file(
+        UBUNTU_BASE_URL,
+        archive,
+        "Ubuntu 22.04.5",
+    ):
+
+        return False
+
+    log(
+        "Extracting Ubuntu rootfs..."
+    )
+
+    # Clean partial installation.
+    for item in ROOTFS.iterdir():
+
+        try:
+
+            if item.is_dir():
+                shutil.rmtree(
+                    item
+                )
+
+            else:
+                item.unlink()
+
+        except Exception as e:
+
+            log(
+                f"Could not remove {item}: {e}"
+            )
+
+    try:
+
+        with tarfile.open(
+            archive,
+            "r:gz",
+        ) as tar:
+
+            tar.extractall(
+                ROOTFS
+            )
+
+    except Exception as e:
+
+        log(
+            f"Ubuntu extraction failed: {e}"
+        )
+
+        return False
+
+    # DNS
+    etc = ROOTFS / "etc"
+
+    etc.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    try:
+
+        resolv = (
+            "nameserver 1.1.1.1\n"
+            "nameserver 1.0.0.1\n"
+        )
+
+        (etc / "resolv.conf").write_text(
+            resolv
+        )
+
+    except Exception as e:
+
+        log(
+            f"DNS configuration warning: {e}"
+        )
+
+    # hostname
+    try:
+
+        (
+            etc / "hostname"
+        ).write_text(
+            "shl"
+        )
+
+        (
+            etc / "hosts"
+        ).write_text(
+            "127.0.0.1 localhost\n"
+            "127.0.1.1 shl\n"
+            "::1 localhost ip6-localhost "
+            "ip6-loopback\n"
+        )
+
+    except Exception:
+        pass
+
+    try:
+
+        archive.unlink(
+            missing_ok=True
+        )
+
+    except Exception:
+        pass
+
+    ROOTFS_MARKER.touch()
+
+    log(
+        "Ubuntu rootfs installed."
+    )
 
     return True
 
 
 # ============================================================
-# PROOT COMMAND
+# PROOT
 # ============================================================
 
-def proot_binary():
+def install_proot():
 
-    candidates = [
-        FREEROOT_DIR / "usr" / "local" / "bin" / "apk",
-        FREEROOT_DIR / "proot-x86_64",
-        FREEROOT_DIR / "proot-amd64",
-    ]
+    if (
+        PROOT.exists()
+        and PROOT_MARKER.exists()
+    ):
 
-    for path in candidates:
-        if path.exists() and os.access(path, os.X_OK):
-            return path
+        log(
+            "PRoot already installed."
+        )
 
-    return None
+        return True
 
+    log(
+        "Downloading PRoot..."
+    )
 
-def root_command(command):
+    if not download_file(
+        PROOT_URL,
+        PROOT,
+        "PRoot amd64",
+    ):
 
-    proot = proot_binary()
+        return False
 
-    if not proot:
-        raise RuntimeError("FreeRoot Proot binary not found.")
+    try:
 
-    config = FREEROOT_DIR / "usr" / "local" / ".config" / "proot.yml"
+        PROOT.chmod(
+            0o755
+        )
 
-    env = os.environ.copy()
-    env["PROOT_CONFIG"] = str(config)
+    except Exception as e:
 
-    return subprocess.Popen(
-        [str(proot), *command],
-        cwd=str(FREEROOT_DIR),
-        env=env,
-        stdin=subprocess.DEVNULL,
+        log(
+            f"Could not chmod PRoot: {e}"
+        )
+
+        return False
+
+    # Verify executable.
+    result = subprocess.run(
+        [
+            str(PROOT),
+            "--help",
+        ],
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
-        start_new_session=True,
+        timeout=20,
+    )
+
+    write_log(
+        "proot-help.log",
+        result.stdout or "",
+    )
+
+    if result.returncode not in (
+        0,
+        1,
+    ):
+
+        log(
+            "PRoot executable verification failed."
+        )
+
+        log(
+            result.stdout[-3000:]
+        )
+
+        return False
+
+    PROOT_MARKER.touch()
+
+    log(
+        "PRoot installed successfully."
+    )
+
+    return True
+
+
+# ============================================================
+# UBUNTU COMMAND
+# ============================================================
+
+def ubuntu_command(
+    command,
+    background=False,
+):
+
+    if isinstance(
+        command,
+        str,
+    ):
+
+        shell_command = command
+
+    else:
+
+        shell_command = " ".join(
+            subprocess.list2cmdline(
+                [str(x)]
+            )
+            for x in command
+        )
+
+    # We deliberately use the standard PRoot
+    # command-line interface.
+    #
+    # -r ROOTFS       guest root filesystem
+    # -0               fake root UID/GID
+    # -w /root        working directory
+    # -b /dev         expose devices
+    # -b /proc        expose proc
+    # -b /sys         expose sys
+    # -b /dev/pts     expose PTY
+    # -b resolv.conf  DNS
+    #
+    # PRoot does not create a real kernel VM/root.
+    # It translates filesystem/process operations
+    # in user space.
+
+    cmd = [
+        str(PROOT),
+
+        "-r",
+        str(ROOTFS),
+
+        "-0",
+
+        "-w",
+        "/root",
+
+        "-b",
+        "/dev",
+
+        "-b",
+        "/dev/pts",
+
+        "-b",
+        "/proc",
+
+        "-b",
+        "/sys",
+
+        "-b",
+        f"{ROOTFS}/etc/resolv.conf:/etc/resolv.conf",
+
+        "/bin/bash",
+
+        "-lc",
+
+        shell_command,
+    ]
+
+    log(
+        "Ubuntu command: "
+        + " ".join(cmd)
+    )
+
+    if background:
+
+        return subprocess.Popen(
+            cmd,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            start_new_session=True,
+        )
+
+    return subprocess.run(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        timeout=300,
+        check=False,
     )
 
 
 # ============================================================
-# UBUNTU TEST
+# TEST UBUNTU
 # ============================================================
 
-@st.cache_resource
-def start_ubuntu():
+def test_ubuntu():
 
-    log("Starting Ubuntu/FreeRoot...")
+    result = ubuntu_command(
+        """
+        echo SHL_UBUNTU_OK
+        echo "USER=$(id -un)"
+        echo "UID=$(id -u)"
+        echo "OS=$(grep PRETTY_NAME /etc/os-release 2>/dev/null)"
+        echo "ARCH=$(uname -m)"
+        """
+    )
 
-    process = root_command([
-        "/bin/bash",
-        "-lc",
-        "echo 'SHL_UBUNTU_READY'; exec sleep infinity",
-    ])
+    output = result.stdout or ""
 
-    return process
+    write_log(
+        "ubuntu-test.log",
+        output,
+    )
 
-
-def ubuntu_alive(process):
+    log(
+        output[-5000:]
+    )
 
     return (
-        process is not None
-        and process.poll() is None
+        "SHL_UBUNTU_OK" in output
+        and result.returncode == 0
     )
+
+
+# ============================================================
+# INSTALL BASIC TOOLS IN UBUNTU
+# ============================================================
+
+def prepare_ubuntu_tools():
+
+    marker = (
+        ROOTFS
+        / "root"
+        / ".shl_tools_ready"
+    )
+
+    if marker.exists():
+
+        return True
+
+    log(
+        "Installing basic Ubuntu tools..."
+    )
+
+    result = ubuntu_command(
+        """
+        export DEBIAN_FRONTEND=noninteractive
+
+        apt-get update
+
+        apt-get install -y \
+            bash \
+            ca-certificates \
+            curl \
+            wget \
+            unzip \
+            tar \
+            gzip \
+            procps \
+            iproute2 \
+            iputils-ping \
+            net-tools \
+            python3 \
+            python3-pip
+
+        touch /root/.shl_tools_ready
+        """
+    )
+
+    output = result.stdout or ""
+
+    write_log(
+        "ubuntu-tools.log",
+        output,
+    )
+
+    if result.returncode != 0:
+
+        log(
+            "Ubuntu tools installation failed."
+        )
+
+        log(
+            output[-5000:]
+        )
+
+        return False
+
+    log(
+        "Ubuntu tools installed."
+    )
+
+    return True
 
 
 # ============================================================
@@ -220,83 +720,134 @@ def install_sshx():
         exist_ok=True,
     )
 
-    if SSHX_PATH.exists():
-        SSHX_PATH.chmod(0o755)
+    if SSHX.exists():
+
+        try:
+            SSHX.chmod(0o755)
+        except Exception:
+            pass
+
         return True
 
-    archive = Path("/tmp/sshx.tar.gz")
-    extract_dir = Path("/tmp/sshx_extract")
+    archive = (
+        RUNTIME
+        / "sshx.tar.gz"
+    )
+
+    extract = (
+        RUNTIME
+        / "sshx-extract"
+    )
+
+    if not download_file(
+        SSHX_URL,
+        archive,
+        "SSHX",
+    ):
+
+        return False
+
+    shutil.rmtree(
+        extract,
+        ignore_errors=True,
+    )
+
+    extract.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
 
     try:
-
-        log("Downloading SSHX...")
-
-        urllib.request.urlretrieve(
-            SSHX_URL,
-            archive,
-        )
-
-        shutil.rmtree(
-            extract_dir,
-            ignore_errors=True,
-        )
-
-        extract_dir.mkdir(
-            parents=True,
-            exist_ok=True,
-        )
 
         with tarfile.open(
             archive,
             "r:gz",
         ) as tar:
-            tar.extractall(extract_dir)
 
-        found = None
-
-        for p in extract_dir.rglob("sshx"):
-            if p.is_file():
-                found = p
-                break
-
-        if found is None:
-            raise RuntimeError(
-                "SSHX executable not found in archive."
+            tar.extractall(
+                extract
             )
-
-        shutil.copy2(
-            found,
-            SSHX_PATH,
-        )
-
-        SSHX_PATH.chmod(0o755)
-
-        log(f"SSHX installed: {SSHX_PATH}")
-
-        return True
 
     except Exception as e:
 
-        log(f"SSHX installation error: {e}")
+        log(
+            f"SSHX extraction failed: {e}"
+        )
 
         return False
 
-    finally:
+    found = None
 
-        try:
-            archive.unlink(
-                missing_ok=True,
-            )
-        except Exception:
-            pass
+    for path in extract.rglob(
+        "sshx"
+    ):
 
+        if path.is_file():
+
+            found = path
+
+            break
+
+    if found is None:
+
+        log(
+            "SSHX executable not found."
+        )
+
+        return False
+
+    try:
+
+        shutil.copy2(
+            found,
+            SSHX,
+        )
+
+        SSHX.chmod(
+            0o755
+        )
+
+    except Exception as e:
+
+        log(
+            f"SSHX installation failed: {e}"
+        )
+
+        return False
+
+    SSHX_MARKER.touch()
+
+    try:
+        archive.unlink(
+            missing_ok=True
+        )
+    except Exception:
+        pass
+
+    shutil.rmtree(
+        extract,
+        ignore_errors=True,
+    )
+
+    log(
+        f"SSHX installed at {SSHX}"
+    )
+
+    return True
+
+
+# ============================================================
+# SSHX MANAGER
+# ============================================================
 
 class SSHXManager:
 
     def __init__(self):
 
         self.process = None
+
         self.url = None
+
         self.lock = threading.Lock()
 
     def start(self):
@@ -305,26 +856,43 @@ class SSHXManager:
 
             if (
                 self.process
-                and self.process.poll() is None
+                and self.process.poll()
+                is None
             ):
+
                 return
 
             if not install_sshx():
+
                 return
 
-            log("Starting SSHX...")
+            log(
+                "Starting SSHX..."
+            )
 
             self.url = None
 
-            self.process = subprocess.Popen(
-                [str(SSHX_PATH)],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                stdin=subprocess.DEVNULL,
-                text=True,
-                bufsize=1,
-                start_new_session=True,
-            )
+            try:
+
+                self.process = subprocess.Popen(
+                    [
+                        str(SSHX)
+                    ],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    bufsize=1,
+                    start_new_session=True,
+                )
+
+            except Exception as e:
+
+                log(
+                    f"SSHX start error: {e}"
+                )
+
+                return
 
             threading.Thread(
                 target=self.read_output,
@@ -353,20 +921,26 @@ class SSHXManager:
                 if not line:
                     continue
 
-                log("[SSHX] " + line)
+                log(
+                    "[SSHX] "
+                    + line
+                )
 
-                urls = re.findall(
+                matches = re.findall(
                     r"https?://[^\s]+",
                     line,
                 )
 
-                for url in urls:
+                for url in matches:
 
                     url = url.rstrip(
                         ".,;)]}\"'"
                     )
 
-                    if "sshx.io" in url:
+                    if (
+                        "sshx.io"
+                        in url
+                    ):
 
                         self.url = url
 
@@ -378,14 +952,15 @@ class SSHXManager:
         except Exception as e:
 
             log(
-                f"SSHX reader error: {e}"
+                f"SSHX output error: {e}"
             )
 
     def alive(self):
 
         return (
             self.process is not None
-            and self.process.poll() is None
+            and self.process.poll()
+            is None
         )
 
 
@@ -393,192 +968,295 @@ class SSHXManager:
 def get_sshx():
 
     manager = SSHXManager()
+
     manager.start()
 
     return manager
 
 
 # ============================================================
-# SERVICE PLACEHOLDERS
+# INITIALIZATION
 # ============================================================
 
-def service_status():
+def initialize():
 
-    """
-    This is intentionally separated from FreeRoot.
+    prepare_directories()
 
-    Xray / Argo / SPMA will be attached here after
-    their exact existing commands/configuration are
-    confirmed.
+    arch = check_architecture()
 
-    We do NOT invent configurations or overwrite them.
-    """
+    log(
+        f"Architecture selected: {arch}"
+    )
 
-    return {
-        "Ubuntu / FreeRoot": True,
-        "SSHX": False,
-        "Xray": False,
-        "Argo": False,
-        "SPMA": False,
-    }
+    # --------------------------------------------------------
+    # Ubuntu
+    # --------------------------------------------------------
+
+    if not install_ubuntu():
+
+        return False, "Ubuntu installation failed."
+
+    # --------------------------------------------------------
+    # PRoot
+    # --------------------------------------------------------
+
+    if not install_proot():
+
+        return False, "PRoot installation failed."
+
+    # --------------------------------------------------------
+    # Test Ubuntu
+    # --------------------------------------------------------
+
+    if not test_ubuntu():
+
+        return False, "Ubuntu/PRoot test failed."
+
+    # --------------------------------------------------------
+    # Ubuntu tools
+    # --------------------------------------------------------
+
+    if not prepare_ubuntu_tools():
+
+        return False, (
+            "Ubuntu package installation failed."
+        )
+
+    return True, "OK"
 
 
 # ============================================================
-# STREAMLIT UI
+# UI
 # ============================================================
 
-st.set_page_config(
-    page_title="SHL Server",
-    page_icon="🖥️",
-    layout="wide",
+st.title(
+    "🖥️ SHL Personal Server"
 )
-
-st.title("🖥️ SHL Runtime Server")
 
 st.caption(
-    "FreeRoot + Ubuntu + SSHX bootstrap"
+    "Ubuntu 22.04.5 + PRoot + SSHX"
 )
 
-# ------------------------------------------------------------
-# FreeRoot
-# ------------------------------------------------------------
 
-with st.spinner(
-    "Preparing Ubuntu / FreeRoot..."
-):
+# ============================================================
+# BOOTSTRAP
+# ============================================================
 
-    freeroot_ok = prepare_freeroot()
+with st.status(
+    "Preparing server...",
+    expanded=True,
+) as status:
 
-if not freeroot_ok:
+    try:
 
-    st.error(
-        "FreeRoot installation failed."
-    )
+        ok, message = initialize()
 
-    st.stop()
+        if ok:
+
+            status.update(
+                label="Server ready",
+                state="complete",
+                expanded=False,
+            )
+
+        else:
+
+            status.update(
+                label=message,
+                state="error",
+                expanded=True,
+            )
+
+            st.stop()
+
+    except Exception as e:
+
+        status.update(
+            label="Bootstrap failed",
+            state="error",
+            expanded=True,
+        )
+
+        st.exception(e)
+
+        st.stop()
 
 
-ubuntu = start_ubuntu()
+# ============================================================
+# SERVER STATUS
+# ============================================================
 
-if ubuntu_alive(ubuntu):
+st.divider()
+
+st.subheader(
+    "Server status"
+)
+
+col1, col2, col3 = st.columns(3)
+
+with col1:
 
     st.success(
-        "Ubuntu / FreeRoot: RUNNING"
+        "🟢 Ubuntu / PRoot"
     )
 
-else:
+with col2:
 
-    st.error(
-        "Ubuntu / FreeRoot: STOPPED"
+    if PROOT.exists():
+
+        st.success(
+            "🟢 PRoot"
+        )
+
+    else:
+
+        st.error(
+            "🔴 PRoot"
+        )
+
+with col3:
+
+    st.success(
+        "🟢 Runtime"
     )
 
 
-# ------------------------------------------------------------
+# ============================================================
 # SSHX
-# ------------------------------------------------------------
+# ============================================================
+
+st.divider()
+
+st.subheader(
+    "SSHX"
+)
 
 manager = get_sshx()
 
 if manager.alive():
 
     st.success(
-        "SSHX: RUNNING"
+        "🟢 SSHX is running"
     )
 
 else:
 
     st.error(
-        "SSHX: STOPPED"
+        "🔴 SSHX is not running"
     )
 
-url = manager.url
 
-if url:
+# Wait for URL.
+for _ in range(20):
 
-    st.subheader(
-        "SSHX Public URL"
+    if manager.url:
+        break
+
+    time.sleep(0.25)
+
+
+if manager.url:
+
+    st.success(
+        "SSHX public URL:"
     )
 
     st.code(
-        url,
+        manager.url,
         language="text",
     )
 
     st.markdown(
-        f"[Open SSHX terminal]({url})"
+        f"[🔗 Open SSHX terminal]({manager.url})"
     )
 
 else:
 
-    st.info(
-        "Waiting for SSHX public URL..."
+    st.warning(
+        "SSHX is running, but the public URL "
+        "has not appeared yet. Refresh the page."
     )
 
 
-# ------------------------------------------------------------
-# STATUS
-# ------------------------------------------------------------
+# ============================================================
+# UBUNTU TEST
+# ============================================================
 
 st.divider()
 
 st.subheader(
-    "Server components"
+    "Ubuntu test"
 )
 
-status = service_status()
+if st.button(
+    "Test Ubuntu shell"
+):
 
-for name, running in status.items():
+    result = ubuntu_command(
+        """
+        echo "================================"
+        echo "SHL UBUNTU"
+        echo "================================"
+        echo "User: $(id -un)"
+        echo "UID:  $(id -u)"
+        echo "Arch: $(uname -m)"
+        echo
+        cat /etc/os-release
+        echo
+        echo "Disk:"
+        df -h /
+        echo
+        echo "Memory:"
+        free -h
+        """
+    )
 
-    if name == "SSHX":
-        running = manager.alive()
-
-    if name == "Ubuntu / FreeRoot":
-        running = ubuntu_alive(ubuntu)
-
-    if running:
-        st.write(
-            f"🟢 {name}: RUNNING"
-        )
-    else:
-        st.write(
-            f"⚪ {name}: NOT CONFIGURED / STOPPED"
-        )
+    st.code(
+        result.stdout or "",
+        language="text",
+    )
 
 
-# ------------------------------------------------------------
-# INFORMATION
-# ------------------------------------------------------------
+# ============================================================
+# FUTURE SERVICES
+# ============================================================
 
 st.divider()
 
+st.subheader(
+    "Services"
+)
+
 st.info(
     """
-Streamlit Community Cloud runtime is ephemeral.
+Xray / Argo / SPMA will be installed inside
+the Ubuntu rootfs in the next stage.
 
-This application therefore rebuilds its runtime environment
-automatically after a fresh deployment/reboot.
-
-Project source remains in GitHub.
-Runtime-generated files are not treated as permanent storage.
+They are intentionally not started yet so that
+the base Ubuntu + PRoot environment can be verified
+first.
 """
 )
 
 
-# ------------------------------------------------------------
+# ============================================================
 # DEBUG
-# ------------------------------------------------------------
+# ============================================================
 
-with st.expander("Runtime information"):
+with st.expander(
+    "Runtime information"
+):
 
     st.code(
         "\n".join([
             f"Python: {sys.version}",
-            f"Platform: {platform.platform()}",
-            f"Architecture: {platform.machine()}",
-            f"Working directory: {APP_DIR}",
-            f"Runtime directory: {RUNTIME_DIR}",
-            f"FreeRoot directory: {FREEROOT_DIR}",
-            f"SSHX: {SSHX_PATH}",
+            f"Host OS: {platform.platform()}",
+            f"Host architecture: {platform.machine()}",
+            f"Runtime: {RUNTIME}",
+            f"Ubuntu rootfs: {ROOTFS}",
+            f"PRoot: {PROOT}",
+            f"SSHX: {SSHX}",
+            f"SSHX URL: {manager.url}",
         ]),
         language="text",
     )
