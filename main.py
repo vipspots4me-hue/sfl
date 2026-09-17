@@ -1,9 +1,14 @@
+cd /mount/src/sfl
+
+cat > main.py <<'PY'
 import os
 import re
 import sys
 import time
 import tarfile
 import shutil
+import signal
+import hashlib
 import platform
 import subprocess
 import threading
@@ -13,10 +18,513 @@ from pathlib import Path
 import streamlit as st
 
 
-# ============================================================
-# SHL SERVER
-# FreeRoot-style Ubuntu + PRoot + SSHX
-# ============================================================
+BASE_DIR = Path("/tmp/shl-runtime")
+ROOTFS_DIR = BASE_DIR / "ubuntu"
+PROOT_DIR = BASE_DIR / "proot"
+PROOT_PATH = PROOT_DIR / "proot"
+LOCK_FILE = BASE_DIR / ".bootstrap.lock"
+STATE_FILE = BASE_DIR / ".bootstrap.ok"
+
+UBUNTU_VERSION = "22.04.5"
+UBUNTU_URL = (
+    "https://cdimage.ubuntu.com/ubuntu-base/releases/22.04/release/"
+    "ubuntu-base-22.04.5-base-amd64.tar.gz"
+)
+PROOT_URL = (
+    "https://github.com/Mytai20100/freeproot/releases/latest/download/proot-amd64"
+)
+
+SSHX_DIR = Path.home() / ".local" / "bin"
+SSHX_PATH = SSHX_DIR / "sshx"
+SSHX_URL = "https://s3.amazonaws.com/sshx/sshx-x86_64-unknown-linux-musl.tar.gz"
+
+_lock = threading.Lock()
+_sshx_process = None
+_sshx_link = None
+
+
+def log(msg):
+    print(f"[SHL] {msg}", flush=True)
+
+
+def run(cmd, cwd=None, timeout=None, env=None):
+    log("$ " + " ".join(map(str, cmd)))
+    return subprocess.run(
+        [str(x) for x in cmd],
+        cwd=str(cwd) if cwd else None,
+        timeout=timeout,
+        env=env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    )
+
+
+def download(url, destination, label):
+    destination = Path(destination)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temp = destination.with_suffix(destination.suffix + ".part")
+
+    if temp.exists():
+        temp.unlink()
+
+    log(f"Downloading {label}: {url}")
+
+    def progress(block, block_size, total):
+        if total > 0:
+            percent = min(100, block * block_size * 100 / total)
+            print(f"[SHL] {label}: {percent:.1f}%", flush=True)
+
+    urllib.request.urlretrieve(url, temp, progress)
+
+    if not temp.exists() or temp.stat().st_size == 0:
+        raise RuntimeError(f"{label}: empty download")
+
+    temp.replace(destination)
+    return destination
+
+
+def detect_arch():
+    machine = platform.machine().lower()
+
+    if machine in ("x86_64", "amd64"):
+        arch = "amd64"
+    elif machine in ("aarch64", "arm64"):
+        arch = "arm64"
+    else:
+        raise RuntimeError(f"Unsupported architecture: {machine}")
+
+    log(f"Detected architecture: {machine}")
+    log(f"Architecture selected: {arch}")
+    return arch
+
+
+def acquire_lock():
+    BASE_DIR.mkdir(parents=True, exist_ok=True)
+
+    for _ in range(120):
+        try:
+            fd = os.open(
+                LOCK_FILE,
+                os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+            )
+            os.write(fd, str(os.getpid()).encode())
+            os.close(fd)
+            return True
+        except FileExistsError:
+            time.sleep(0.5)
+
+    return False
+
+
+def release_lock():
+    try:
+        LOCK_FILE.unlink()
+    except FileNotFoundError:
+        pass
+
+
+def safe_extract(tar_path, destination):
+    destination = Path(destination).resolve()
+
+    with tarfile.open(tar_path, "r:gz") as tar:
+        for member in tar.getmembers():
+            target = (destination / member.name).resolve()
+            if not str(target).startswith(str(destination) + os.sep):
+                raise RuntimeError("Unsafe archive path detected")
+        tar.extractall(destination)
+
+
+def install_rootfs():
+    BASE_DIR.mkdir(parents=True, exist_ok=True)
+
+    if ROOTFS_DIR.exists() and (ROOTFS_DIR / "bin/bash").exists():
+        log("Ubuntu rootfs already exists.")
+        return True
+
+    log("Ubuntu rootfs is not installed.")
+
+    archive = BASE_DIR / f"ubuntu-{UBUNTU_VERSION}.tar.gz"
+
+    if archive.exists() and archive.stat().st_size == 0:
+        archive.unlink()
+
+    try:
+        download(
+            UBUNTU_URL,
+            archive,
+            f"Ubuntu {UBUNTU_VERSION}",
+        )
+
+        temp_root = BASE_DIR / "ubuntu.extracting"
+
+        if temp_root.exists():
+            shutil.rmtree(temp_root)
+
+        temp_root.mkdir(parents=True)
+
+        log("Extracting Ubuntu rootfs...")
+        safe_extract(archive, temp_root)
+
+        if not (temp_root / "bin/bash").exists():
+            raise RuntimeError("Extracted Ubuntu rootfs is incomplete")
+
+        if ROOTFS_DIR.exists():
+            shutil.rmtree(ROOTFS_DIR)
+
+        temp_root.rename(ROOTFS_DIR)
+
+        resolv = ROOTFS_DIR / "etc/resolv.conf"
+        resolv.parent.mkdir(parents=True, exist_ok=True)
+
+        try:
+            if resolv.is_symlink() or resolv.exists():
+                resolv.unlink()
+        except Exception:
+            pass
+
+        resolv.write_text(
+            "nameserver 1.1.1.1\n"
+            "nameserver 1.0.0.1\n"
+        )
+
+        (ROOTFS_DIR / "etc/hostname").write_text("shl-ubuntu\n")
+
+        hosts = ROOTFS_DIR / "etc/hosts"
+        hosts.write_text(
+            "127.0.0.1 localhost\n"
+            "127.0.1.1 shl-ubuntu\n"
+            "::1 localhost ip6-localhost ip6-loopback\n"
+        )
+
+        log("Ubuntu rootfs installed successfully.")
+        return True
+
+    except Exception as e:
+        log(f"Ubuntu rootfs installation failed: {e}")
+
+        temp_root = BASE_DIR / "ubuntu.extracting"
+        if temp_root.exists():
+            shutil.rmtree(temp_root, ignore_errors=True)
+
+        if archive.exists() and archive.stat().st_size == 0:
+            archive.unlink(missing_ok=True)
+
+        return False
+
+
+def install_proot():
+    if PROOT_PATH.exists() and os.access(PROOT_PATH, os.X_OK):
+        log("PRoot already installed.")
+        return True
+
+    PROOT_DIR.mkdir(parents=True, exist_ok=True)
+
+    temp = PROOT_DIR / "proot.part"
+
+    if temp.exists():
+        temp.unlink()
+
+    try:
+        download(
+            PROOT_URL,
+            temp,
+            "PRoot amd64",
+        )
+
+        if temp.stat().st_size < 100000:
+            raise RuntimeError("PRoot binary is unexpectedly small")
+
+        temp.chmod(0o755)
+        temp.replace(PROOT_PATH)
+
+        result = run(
+            [PROOT_PATH, "--help"],
+            timeout=20,
+        )
+
+        if result.returncode not in (0, 1):
+            raise RuntimeError(
+                "PRoot executable test failed:\n" + result.stdout
+            )
+
+        log("PRoot installed successfully.")
+        return True
+
+    except Exception as e:
+        log(f"PRoot installation failed: {e}")
+        temp.unlink(missing_ok=True)
+        return False
+
+
+def ubuntu_command(command, timeout=None):
+    if not ROOTFS_DIR.exists():
+        raise RuntimeError("Ubuntu rootfs missing")
+
+    cmd = [
+        PROOT_PATH,
+        "-r", ROOTFS_DIR,
+        "-0",
+        "-w", "/root",
+        "-b", "/dev",
+        "-b", "/dev/pts",
+        "-b", "/proc",
+        "-b", "/sys",
+        "-b", f"{ROOTFS_DIR}/etc/resolv.conf:/etc/resolv.conf",
+        "/bin/bash",
+        "-lc",
+        command,
+    ]
+
+    result = run(cmd, timeout=timeout)
+    return result
+
+
+def test_ubuntu():
+    result = ubuntu_command(
+        """
+echo SHL_UBUNTU_OK
+echo "USER=$(id -un)"
+echo "UID=$(id -u)"
+echo "OS=$(grep PRETTY_NAME /etc/os-release 2>/dev/null)"
+echo "ARCH=$(uname -m)"
+""",
+        timeout=60,
+    )
+
+    print(result.stdout, end="", flush=True)
+
+    if result.returncode != 0 or "SHL_UBUNTU_OK" not in result.stdout:
+        raise RuntimeError("Ubuntu/PRoot test failed")
+
+    return True
+
+
+def install_tools():
+    marker = ROOTFS_DIR / "root/.shl_tools_ready"
+
+    if marker.exists():
+        log("Ubuntu basic tools already installed.")
+        return True
+
+    log("Installing basic Ubuntu tools...")
+
+    command = """
+export DEBIAN_FRONTEND=noninteractive
+export LC_ALL=C
+export LANG=C
+apt-get update
+apt-get install -y \
+    bash \
+    ca-certificates \
+    curl \
+    wget \
+    unzip \
+    tar \
+    gzip \
+    procps \
+    iproute2 \
+    iputils-ping \
+    net-tools \
+    python3 \
+    python3-pip \
+    git \
+    openssl \
+    netcat-openbsd
+mkdir -p /root
+touch /root/.shl_tools_ready
+"""
+
+    result = ubuntu_command(command, timeout=600)
+
+    print(result.stdout, end="", flush=True)
+
+    if result.returncode != 0:
+        raise RuntimeError("Ubuntu tools installation failed")
+
+    log("Ubuntu tools installed.")
+    return True
+
+
+def find_sshx():
+    candidates = [
+        SSHX_PATH,
+        Path("/usr/local/bin/sshx"),
+        Path("/usr/bin/sshx"),
+        Path("/root/.local/bin/sshx"),
+    ]
+
+    for path in candidates:
+        if path.exists() and os.access(path, os.X_OK):
+            return path
+
+    found = shutil.which("sshx")
+    if found:
+        return Path(found)
+
+    return None
+
+
+def install_sshx():
+    global SSHX_PATH
+
+    found = find_sshx()
+    if found:
+        SSHX_PATH = found
+        log(f"SSHX already installed: {SSHX_PATH}")
+        return SSHX_PATH
+
+    SSHX_DIR.mkdir(parents=True, exist_ok=True)
+
+    archive = BASE_DIR / "sshx.tar.gz"
+
+    log("Downloading SSHX...")
+
+    try:
+        download(
+            SSHX_URL,
+            archive,
+            "SSHX",
+        )
+
+        extract_dir = BASE_DIR / "sshx-extract"
+
+        if extract_dir.exists():
+            shutil.rmtree(extract_dir)
+
+        extract_dir.mkdir()
+
+        with tarfile.open(archive, "r:gz") as tar:
+            tar.extractall(extract_dir)
+
+        binary = None
+
+        for p in extract_dir.rglob("sshx"):
+            if p.is_file():
+                binary = p
+                break
+
+        if binary is None:
+            raise RuntimeError("sshx binary not found in archive")
+
+        shutil.copy2(binary, SSHX_PATH)
+        SSHX_PATH.chmod(0o755)
+
+        log(f"SSHX installed: {SSHX_PATH}")
+        return SSHX_PATH
+
+    except Exception as e:
+        log(f"SSHX installation failed: {e}")
+        raise
+
+
+def start_sshx():
+    global _sshx_process
+    global _sshx_link
+
+    with _lock:
+        if _sshx_process is not None and _sshx_process.poll() is None:
+            return _sshx_link
+
+        path = install_sshx()
+
+        log("Starting SSHX...")
+
+        env = os.environ.copy()
+        env["PATH"] = f"{path.parent}:{env.get('PATH', '')}"
+
+        _sshx_process = subprocess.Popen(
+            [str(path), "--quiet"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL,
+            text=True,
+            bufsize=1,
+            env=env,
+        )
+
+        link = None
+        start = time.time()
+
+        while time.time() - start < 30:
+            line = _sshx_process.stdout.readline()
+
+            if line:
+                line = line.rstrip()
+                log("[SSHX] " + line)
+
+                match = re.search(
+                    r"https://sshx\.io/s/[A-Za-z0-9_-]+#[A-Za-z0-9_-]+",
+                    line,
+                )
+
+                if match:
+                    link = match.group(0)
+                    break
+
+            if _sshx_process.poll() is not None:
+                break
+
+        if not link:
+            raise RuntimeError("SSHX URL was not generated")
+
+        _sshx_link = link
+        log(f"SSHX URL: {_sshx_link}")
+
+        return _sshx_link
+
+
+def bootstrap():
+    if STATE_FILE.exists():
+        if ROOTFS_DIR.exists() and PROOT_PATH.exists():
+            try:
+                test_ubuntu()
+                install_tools()
+                return True
+            except Exception:
+                log("Existing bootstrap state is invalid; rebuilding.")
+
+        STATE_FILE.unlink(missing_ok=True)
+
+    if not acquire_lock():
+        log("Another bootstrap process is running. Waiting...")
+
+        for _ in range(180):
+            if STATE_FILE.exists():
+                return True
+            time.sleep(1)
+
+        raise RuntimeError("Bootstrap lock timeout")
+
+    try:
+        if STATE_FILE.exists():
+            return True
+
+        arch = detect_arch()
+
+        if arch != "amd64":
+            raise RuntimeError("This build currently supports amd64 only")
+
+        if not install_rootfs():
+            raise RuntimeError("Ubuntu rootfs could not be installed")
+
+        if not install_proot():
+            raise RuntimeError("PRoot could not be installed")
+
+        test_ubuntu()
+        install_tools()
+
+        STATE_FILE.write_text(
+            f"ok\n"
+            f"pid={os.getpid()}\n"
+            f"time={time.time()}\n"
+        )
+
+        return True
+
+    finally:
+        release_lock()
+
 
 st.set_page_config(
     page_title="SHL Server",
@@ -24,1239 +532,91 @@ st.set_page_config(
     layout="wide",
 )
 
+st.title("SHL Server")
 
-# ============================================================
-# PATHS
-# ============================================================
+if "boot_done" not in st.session_state:
+    st.session_state.boot_done = False
 
-RUNTIME = Path("/tmp/shl-runtime")
-
-ROOTFS = RUNTIME / "ubuntu"
-
-PROOT_DIR = RUNTIME / "proot"
-
-PROOT = PROOT_DIR / "proot"
-
-LOG_DIR = RUNTIME / "logs"
-
-STATE_DIR = RUNTIME / "state"
-
-SSHX_DIR = Path.home() / ".local" / "bin"
-
-SSHX = SSHX_DIR / "sshx"
-
-
-# ============================================================
-# URLS
-# ============================================================
-
-UBUNTU_BASE_URL = (
-    "https://cdimage.ubuntu.com/"
-    "ubuntu-base/releases/22.04/release/"
-    "ubuntu-base-22.04.5-base-amd64.tar.gz"
-)
-
-PROOT_URL = (
-    "https://github.com/"
-    "Mytai20100/freeproot/releases/latest/download/"
-    "proot-amd64"
-)
-
-SSHX_URL = (
-    "https://s3.amazonaws.com/sshx/"
-    "sshx-x86_64-unknown-linux-musl.tar.gz"
-)
-
-
-# ============================================================
-# MARKERS
-# ============================================================
-
-ROOTFS_MARKER = ROOTFS / ".shl_rootfs_ready"
-
-PROOT_MARKER = PROOT_DIR / ".shl_proot_ready"
-
-SSHX_MARKER = STATE_DIR / ".sshx_ready"
-
-
-# ============================================================
-# LOGGING
-# ============================================================
-
-def log(message):
-    print(
-        f"[SHL] {message}",
-        flush=True,
-    )
-
-
-def write_log(name, text):
-
-    LOG_DIR.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
+if not st.session_state.boot_done:
     try:
-        (LOG_DIR / name).write_text(
-            text,
-            errors="ignore",
-        )
-    except Exception:
-        pass
+        with st.spinner("Starting SHL runtime..."):
+            bootstrap()
 
-
-# ============================================================
-# DOWNLOAD
-# ============================================================
-
-def download_file(
-    url,
-    destination,
-    label="file",
-):
-
-    destination = Path(destination)
-
-    destination.parent.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    temporary = destination.with_suffix(
-        destination.suffix + ".download"
-    )
-
-    if temporary.exists():
-        temporary.unlink()
-
-    log(
-        f"Downloading {label}: {url}"
-    )
-
-    try:
-
-        request = urllib.request.Request(
-            url,
-            headers={
-                "User-Agent":
-                    "Mozilla/5.0 SHL-Server"
-            },
-        )
-
-        with urllib.request.urlopen(
-            request,
-            timeout=60,
-        ) as response:
-
-            total = response.headers.get(
-                "Content-Length"
-            )
-
-            total = (
-                int(total)
-                if total
-                else None
-            )
-
-            downloaded = 0
-
-            with open(
-                temporary,
-                "wb",
-            ) as output:
-
-                while True:
-
-                    chunk = response.read(
-                        1024 * 1024
-                    )
-
-                    if not chunk:
-                        break
-
-                    output.write(chunk)
-
-                    downloaded += len(
-                        chunk
-                    )
-
-                    if total:
-
-                        percent = (
-                            downloaded
-                            * 100
-                            / total
-                        )
-
-                        log(
-                            f"{label}: "
-                            f"{percent:.1f}%"
-                        )
-
-        if not temporary.exists():
-            raise RuntimeError(
-                f"{label} download produced no file"
-            )
-
-        if temporary.stat().st_size < 1024:
-
-            raise RuntimeError(
-                f"{label} download is too small"
-            )
-
-        temporary.replace(
-            destination
-        )
-
-        return True
+        st.session_state.boot_done = True
+        st.success("Ubuntu + PRoot آماده است.")
 
     except Exception as e:
-
-        log(
-            f"{label} download failed: {e}"
+        st.error(str(e))
+        st.code(
+            "\n".join([
+                f"BASE_DIR={BASE_DIR}",
+                f"ROOTFS_DIR={ROOTFS_DIR}",
+                f"PROOT_PATH={PROOT_PATH}",
+            ])
         )
-
-        try:
-            temporary.unlink(
-                missing_ok=True
-            )
-        except Exception:
-            pass
-
-        return False
-
-
-# ============================================================
-# ARCHITECTURE
-# ============================================================
-
-def check_architecture():
-
-    arch = platform.machine().lower()
-
-    log(
-        f"Detected architecture: {arch}"
-    )
-
-    if arch not in (
-        "x86_64",
-        "amd64",
-    ):
-
-        raise RuntimeError(
-            "This version currently supports "
-            "x86_64/amd64 only."
-        )
-
-    return "amd64"
-
-
-# ============================================================
-# PREPARE DIRECTORIES
-# ============================================================
-
-def prepare_directories():
-
-    RUNTIME.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    ROOTFS.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    PROOT_DIR.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    LOG_DIR.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    STATE_DIR.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-
-# ============================================================
-# UBUNTU ROOTFS
-# ============================================================
-
-def install_ubuntu():
-
-    if ROOTFS_MARKER.exists():
-
-        log(
-            "Ubuntu rootfs already exists."
-        )
-
-        return True
-
-    archive = (
-        RUNTIME
-        / "ubuntu-base.tar.gz"
-    )
-
-    log(
-        "Ubuntu rootfs is not installed."
-    )
-
-    if not download_file(
-        UBUNTU_BASE_URL,
-        archive,
-        "Ubuntu 22.04.5",
-    ):
-
-        return False
-
-    log(
-        "Extracting Ubuntu rootfs..."
-    )
-
-    # Clean partial installation.
-    for item in ROOTFS.iterdir():
-
-        try:
-
-            if item.is_dir():
-                shutil.rmtree(
-                    item
-                )
-
-            else:
-                item.unlink()
-
-        except Exception as e:
-
-            log(
-                f"Could not remove {item}: {e}"
-            )
-
-    try:
-
-        with tarfile.open(
-            archive,
-            "r:gz",
-        ) as tar:
-
-            tar.extractall(
-                ROOTFS
-            )
-
-    except Exception as e:
-
-        log(
-            f"Ubuntu extraction failed: {e}"
-        )
-
-        return False
-
-    # DNS
-    etc = ROOTFS / "etc"
-
-    etc.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    try:
-
-        resolv = (
-            "nameserver 1.1.1.1\n"
-            "nameserver 1.0.0.1\n"
-        )
-
-        (etc / "resolv.conf").write_text(
-            resolv
-        )
-
-    except Exception as e:
-
-        log(
-            f"DNS configuration warning: {e}"
-        )
-
-    # hostname
-    try:
-
-        (
-            etc / "hostname"
-        ).write_text(
-            "shl"
-        )
-
-        (
-            etc / "hosts"
-        ).write_text(
-            "127.0.0.1 localhost\n"
-            "127.0.1.1 shl\n"
-            "::1 localhost ip6-localhost "
-            "ip6-loopback\n"
-        )
-
-    except Exception:
-        pass
-
-    try:
-
-        archive.unlink(
-            missing_ok=True
-        )
-
-    except Exception:
-        pass
-
-    ROOTFS_MARKER.touch()
-
-    log(
-        "Ubuntu rootfs installed."
-    )
-
-    return True
-
-
-# ============================================================
-# PROOT
-# ============================================================
-
-def install_proot():
-
-    if (
-        PROOT.exists()
-        and PROOT_MARKER.exists()
-    ):
-
-        log(
-            "PRoot already installed."
-        )
-
-        return True
-
-    log(
-        "Downloading PRoot..."
-    )
-
-    if not download_file(
-        PROOT_URL,
-        PROOT,
-        "PRoot amd64",
-    ):
-
-        return False
-
-    try:
-
-        PROOT.chmod(
-            0o755
-        )
-
-    except Exception as e:
-
-        log(
-            f"Could not chmod PRoot: {e}"
-        )
-
-        return False
-
-    # Verify executable.
-    result = subprocess.run(
-        [
-            str(PROOT),
-            "--help",
-        ],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        timeout=20,
-    )
-
-    write_log(
-        "proot-help.log",
-        result.stdout or "",
-    )
-
-    if result.returncode not in (
-        0,
-        1,
-    ):
-
-        log(
-            "PRoot executable verification failed."
-        )
-
-        log(
-            result.stdout[-3000:]
-        )
-
-        return False
-
-    PROOT_MARKER.touch()
-
-    log(
-        "PRoot installed successfully."
-    )
-
-    return True
-
-
-# ============================================================
-# UBUNTU COMMAND
-# ============================================================
-
-def ubuntu_command(
-    command,
-    background=False,
-):
-
-    if isinstance(
-        command,
-        str,
-    ):
-
-        shell_command = command
-
-    else:
-
-        shell_command = " ".join(
-            subprocess.list2cmdline(
-                [str(x)]
-            )
-            for x in command
-        )
-
-    # We deliberately use the standard PRoot
-    # command-line interface.
-    #
-    # -r ROOTFS       guest root filesystem
-    # -0               fake root UID/GID
-    # -w /root        working directory
-    # -b /dev         expose devices
-    # -b /proc        expose proc
-    # -b /sys         expose sys
-    # -b /dev/pts     expose PTY
-    # -b resolv.conf  DNS
-    #
-    # PRoot does not create a real kernel VM/root.
-    # It translates filesystem/process operations
-    # in user space.
-
-    cmd = [
-        str(PROOT),
-
-        "-r",
-        str(ROOTFS),
-
-        "-0",
-
-        "-w",
-        "/root",
-
-        "-b",
-        "/dev",
-
-        "-b",
-        "/dev/pts",
-
-        "-b",
-        "/proc",
-
-        "-b",
-        "/sys",
-
-        "-b",
-        f"{ROOTFS}/etc/resolv.conf:/etc/resolv.conf",
-
-        "/bin/bash",
-
-        "-lc",
-
-        shell_command,
-    ]
-
-    log(
-        "Ubuntu command: "
-        + " ".join(cmd)
-    )
-
-    if background:
-
-        return subprocess.Popen(
-            cmd,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            start_new_session=True,
-        )
-
-    return subprocess.run(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        timeout=300,
-        check=False,
-    )
-
-
-# ============================================================
-# TEST UBUNTU
-# ============================================================
-
-def test_ubuntu():
-
-    result = ubuntu_command(
-        """
-        echo SHL_UBUNTU_OK
-        echo "USER=$(id -un)"
-        echo "UID=$(id -u)"
-        echo "OS=$(grep PRETTY_NAME /etc/os-release 2>/dev/null)"
-        echo "ARCH=$(uname -m)"
-        """
-    )
-
-    output = result.stdout or ""
-
-    write_log(
-        "ubuntu-test.log",
-        output,
-    )
-
-    log(
-        output[-5000:]
-    )
-
-    return (
-        "SHL_UBUNTU_OK" in output
-        and result.returncode == 0
-    )
-
-
-# ============================================================
-# INSTALL BASIC TOOLS IN UBUNTU
-# ============================================================
-
-def prepare_ubuntu_tools():
-
-    marker = (
-        ROOTFS
-        / "root"
-        / ".shl_tools_ready"
-    )
-
-    if marker.exists():
-
-        return True
-
-    log(
-        "Installing basic Ubuntu tools..."
-    )
-
-    result = ubuntu_command(
-        """
-        export DEBIAN_FRONTEND=noninteractive
-
-        apt-get update
-
-        apt-get install -y \
-            bash \
-            ca-certificates \
-            curl \
-            wget \
-            unzip \
-            tar \
-            gzip \
-            procps \
-            iproute2 \
-            iputils-ping \
-            net-tools \
-            python3 \
-            python3-pip
-
-        touch /root/.shl_tools_ready
-        """
-    )
-
-    output = result.stdout or ""
-
-    write_log(
-        "ubuntu-tools.log",
-        output,
-    )
-
-    if result.returncode != 0:
-
-        log(
-            "Ubuntu tools installation failed."
-        )
-
-        log(
-            output[-5000:]
-        )
-
-        return False
-
-    log(
-        "Ubuntu tools installed."
-    )
-
-    return True
-
-
-# ============================================================
-# SSHX
-# ============================================================
-
-def install_sshx():
-
-    SSHX_DIR.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    if SSHX.exists():
-
-        try:
-            SSHX.chmod(0o755)
-        except Exception:
-            pass
-
-        return True
-
-    archive = (
-        RUNTIME
-        / "sshx.tar.gz"
-    )
-
-    extract = (
-        RUNTIME
-        / "sshx-extract"
-    )
-
-    if not download_file(
-        SSHX_URL,
-        archive,
-        "SSHX",
-    ):
-
-        return False
-
-    shutil.rmtree(
-        extract,
-        ignore_errors=True,
-    )
-
-    extract.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    try:
-
-        with tarfile.open(
-            archive,
-            "r:gz",
-        ) as tar:
-
-            tar.extractall(
-                extract
-            )
-
-    except Exception as e:
-
-        log(
-            f"SSHX extraction failed: {e}"
-        )
-
-        return False
-
-    found = None
-
-    for path in extract.rglob(
-        "sshx"
-    ):
-
-        if path.is_file():
-
-            found = path
-
-            break
-
-    if found is None:
-
-        log(
-            "SSHX executable not found."
-        )
-
-        return False
-
-    try:
-
-        shutil.copy2(
-            found,
-            SSHX,
-        )
-
-        SSHX.chmod(
-            0o755
-        )
-
-    except Exception as e:
-
-        log(
-            f"SSHX installation failed: {e}"
-        )
-
-        return False
-
-    SSHX_MARKER.touch()
-
-    try:
-        archive.unlink(
-            missing_ok=True
-        )
-    except Exception:
-        pass
-
-    shutil.rmtree(
-        extract,
-        ignore_errors=True,
-    )
-
-    log(
-        f"SSHX installed at {SSHX}"
-    )
-
-    return True
-
-
-# ============================================================
-# SSHX MANAGER
-# ============================================================
-
-class SSHXManager:
-
-    def __init__(self):
-
-        self.process = None
-
-        self.url = None
-
-        self.lock = threading.Lock()
-
-    def start(self):
-
-        with self.lock:
-
-            if (
-                self.process
-                and self.process.poll()
-                is None
-            ):
-
-                return
-
-            if not install_sshx():
-
-                return
-
-            log(
-                "Starting SSHX..."
-            )
-
-            self.url = None
-
-            try:
-
-                self.process = subprocess.Popen(
-                    [
-                        str(SSHX)
-                    ],
-                    stdin=subprocess.DEVNULL,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    text=True,
-                    bufsize=1,
-                    start_new_session=True,
-                )
-
-            except Exception as e:
-
-                log(
-                    f"SSHX start error: {e}"
-                )
-
-                return
-
-            threading.Thread(
-                target=self.read_output,
-                daemon=True,
-            ).start()
-
-    def read_output(self):
-
-        process = self.process
-
-        if not process:
-            return
-
-        try:
-
-            for line in iter(
-                process.stdout.readline,
-                "",
-            ):
-
-                if not line:
-                    break
-
-                line = line.strip()
-
-                if not line:
-                    continue
-
-                log(
-                    "[SSHX] "
-                    + line
-                )
-
-                matches = re.findall(
-                    r"https?://[^\s]+",
-                    line,
-                )
-
-                for url in matches:
-
-                    url = url.rstrip(
-                        ".,;)]}\"'"
-                    )
-
-                    if (
-                        "sshx.io"
-                        in url
-                    ):
-
-                        self.url = url
-
-                        log(
-                            "SSHX URL: "
-                            + url
-                        )
-
-        except Exception as e:
-
-            log(
-                f"SSHX output error: {e}"
-            )
-
-    def alive(self):
-
-        return (
-            self.process is not None
-            and self.process.poll()
-            is None
-        )
-
-
-@st.cache_resource
-def get_sshx():
-
-    manager = SSHXManager()
-
-    manager.start()
-
-    return manager
-
-
-# ============================================================
-# INITIALIZATION
-# ============================================================
-
-def initialize():
-
-    prepare_directories()
-
-    arch = check_architecture()
-
-    log(
-        f"Architecture selected: {arch}"
-    )
-
-    # --------------------------------------------------------
-    # Ubuntu
-    # --------------------------------------------------------
-
-    if not install_ubuntu():
-
-        return False, "Ubuntu installation failed."
-
-    # --------------------------------------------------------
-    # PRoot
-    # --------------------------------------------------------
-
-    if not install_proot():
-
-        return False, "PRoot installation failed."
-
-    # --------------------------------------------------------
-    # Test Ubuntu
-    # --------------------------------------------------------
-
-    if not test_ubuntu():
-
-        return False, "Ubuntu/PRoot test failed."
-
-    # --------------------------------------------------------
-    # Ubuntu tools
-    # --------------------------------------------------------
-
-    if not prepare_ubuntu_tools():
-
-        return False, (
-            "Ubuntu package installation failed."
-        )
-
-    return True, "OK"
-
-
-# ============================================================
-# UI
-# ============================================================
-
-st.title(
-    "🖥️ SHL Personal Server"
-)
-
-st.caption(
-    "Ubuntu 22.04.5 + PRoot + SSHX"
-)
-
-
-# ============================================================
-# BOOTSTRAP
-# ============================================================
-
-with st.status(
-    "Preparing server...",
-    expanded=True,
-) as status:
-
-    try:
-
-        ok, message = initialize()
-
-        if ok:
-
-            status.update(
-                label="Server ready",
-                state="complete",
-                expanded=False,
-            )
-
-        else:
-
-            status.update(
-                label=message,
-                state="error",
-                expanded=True,
-            )
-
-            st.stop()
-
-    except Exception as e:
-
-        status.update(
-            label="Bootstrap failed",
-            state="error",
-            expanded=True,
-        )
-
-        st.exception(e)
-
         st.stop()
 
 
-# ============================================================
-# SERVER STATUS
-# ============================================================
+try:
+    link = start_sshx()
 
-st.divider()
+    st.subheader("SSHX")
 
-st.subheader(
-    "Server status"
-)
-
-col1, col2, col3 = st.columns(3)
-
-with col1:
-
-    st.success(
-        "🟢 Ubuntu / PRoot"
-    )
-
-with col2:
-
-    if PROOT.exists():
-
-        st.success(
-            "🟢 PRoot"
-        )
-
-    else:
-
-        st.error(
-            "🔴 PRoot"
-        )
-
-with col3:
-
-    st.success(
-        "🟢 Runtime"
-    )
-
-
-# ============================================================
-# SSHX
-# ============================================================
-
-st.divider()
-
-st.subheader(
-    "SSHX"
-)
-
-manager = get_sshx()
-
-if manager.alive():
-
-    st.success(
-        "🟢 SSHX is running"
-    )
-
-else:
-
-    st.error(
-        "🔴 SSHX is not running"
-    )
-
-
-# Wait for URL.
-for _ in range(20):
-
-    if manager.url:
-        break
-
-    time.sleep(0.25)
-
-
-if manager.url:
-
-    st.success(
-        "SSHX public URL:"
-    )
-
-    st.code(
-        manager.url,
-        language="text",
-    )
+    st.code(link)
 
     st.markdown(
-        f"[🔗 Open SSHX terminal]({manager.url})"
+        f"### [Open SSHX]({link})"
     )
 
-else:
-
-    st.warning(
-        "SSHX is running, but the public URL "
-        "has not appeared yet. Refresh the page."
-    )
+except Exception as e:
+    st.error(f"SSHX error: {e}")
 
 
-# ============================================================
-# UBUNTU TEST
-# ============================================================
+st.subheader("Ubuntu")
 
-st.divider()
+col1, col2 = st.columns(2)
 
-st.subheader(
-    "Ubuntu test"
+with col1:
+    if st.button("Test Ubuntu"):
+        result = ubuntu_command(
+            """
+echo "USER=$(id -un)"
+echo "UID=$(id -u)"
+echo "OS=$(grep PRETTY_NAME /etc/os-release 2>/dev/null)"
+echo "ARCH=$(uname -m)"
+echo "ROOTFS=$(df -h / | tail -1)"
+""",
+            timeout=60,
+        )
+
+        st.code(result.stdout)
+
+with col2:
+    if st.button("Restart SSHX"):
+        if _sshx_process is not None:
+            try:
+                _sshx_process.terminate()
+            except Exception:
+                pass
+
+        _sshx_process = None
+        _sshx_link = None
+
+        st.rerun()
+
+
+st.caption(
+    f"Ubuntu: {ROOTFS_DIR} | "
+    f"PRoot: {PROOT_PATH}"
 )
+PY
 
-if st.button(
-    "Test Ubuntu shell"
-):
+cat > requirements.txt <<'EOF'
+streamlit==1.64.0
+EOF
 
-    result = ubuntu_command(
-        """
-        echo "================================"
-        echo "SHL UBUNTU"
-        echo "================================"
-        echo "User: $(id -un)"
-        echo "UID:  $(id -u)"
-        echo "Arch: $(uname -m)"
-        echo
-        cat /etc/os-release
-        echo
-        echo "Disk:"
-        df -h /
-        echo
-        echo "Memory:"
-        free -h
-        """
-    )
+python3.11 -m py_compile main.py
 
-    st.code(
-        result.stdout or "",
-        language="text",
-    )
-
-
-# ============================================================
-# FUTURE SERVICES
-# ============================================================
-
-st.divider()
-
-st.subheader(
-    "Services"
-)
-
-st.info(
-    """
-Xray / Argo / SPMA will be installed inside
-the Ubuntu rootfs in the next stage.
-
-They are intentionally not started yet so that
-the base Ubuntu + PRoot environment can be verified
-first.
-"""
-)
-
-
-# ============================================================
-# DEBUG
-# ============================================================
-
-with st.expander(
-    "Runtime information"
-):
-
-    st.code(
-        "\n".join([
-            f"Python: {sys.version}",
-            f"Host OS: {platform.platform()}",
-            f"Host architecture: {platform.machine()}",
-            f"Runtime: {RUNTIME}",
-            f"Ubuntu rootfs: {ROOTFS}",
-            f"PRoot: {PROOT}",
-            f"SSHX: {SSHX}",
-            f"SSHX URL: {manager.url}",
-        ]),
-        language="text",
-    )
+git add main.py requirements.txt
+git commit -m "fix self rebuilding Ubuntu PRoot bootstrap"
+git push origin main
