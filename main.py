@@ -1588,31 +1588,3 @@ with st.expander(
         st.error(
             "Ubuntu command failed"
         )
-
-
-# ============================================================
-# توضیح معماری
-# ============================================================
-
-with st.expander(
-    "ℹ️ معماری SHL"
-):
-
-    st.markdown(
-        """
-**ساختار فعلی:**
-
-```text
-Streamlit Community Cloud
-        │
-        ├── Debian 13 host
-        │
-        ├── /tmp/shl-runtime
-        │
-        ├── Ubuntu 22.04.5 rootfs
-        │
-        ├── PRoot
-        │
-        └── SSHX
-              │
-              └── Ubuntu 22.04.5 / root
